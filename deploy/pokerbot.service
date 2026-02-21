@@ -1,0 +1,15 @@
+[Unit]
+Description=Poker Tournament Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/pokerbot
+EnvironmentFile=/home/ec2-user/pokerbot/.env
+ExecStart=/home/ec2-user/pokerbot/venv/bin/python poker_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

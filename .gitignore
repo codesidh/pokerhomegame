@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.env
+poker_data.json
+*.pem
+.DS_Store
