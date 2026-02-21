@@ -1133,13 +1133,18 @@ def host_panel_keyboard(game: dict) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("\U0001f3af P&L Grid", callback_data="host_pnlgrid"),
         ],
+        [
+            InlineKeyboardButton("\u2795 Add Player", callback_data="host_addplayer"),
+            InlineKeyboardButton("\u2795 Add Rebuy", callback_data="host_addrebuy"),
+        ],
     ]
 
-    # Player buttons at the bottom
-    player_row = [InlineKeyboardButton("Join Game", callback_data="lobby_join")]
+    # Player buttons at the bottom (hidden when rebuys locked)
     if not rebuy_locked:
-        player_row.append(InlineKeyboardButton("Rebuy", callback_data="lobby_rebuy"))
-    rows.append(player_row)
+        rows.append([
+            InlineKeyboardButton("Join Game", callback_data="lobby_join"),
+            InlineKeyboardButton("Rebuy", callback_data="lobby_rebuy"),
+        ])
 
     return InlineKeyboardMarkup(rows)
 
@@ -1610,6 +1615,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_host_panel(game, chat_id, context)
         return
 
+    # ── New Game Buy-in Selection ─────────────────────────────────────
+    if cb_data.startswith("newgame_buyin_"):
+        await query.answer()
+
+        if game.get("active"):
+            await query.edit_message_text("A tournament is already running!")
+            return
+
+        buyin_str = cb_data[len("newgame_buyin_"):]
+
+        if buyin_str == "custom":
+            game["awaiting_newgame"] = {"user_id": uid, "name": name}
+            save_data(data)
+            await query.edit_message_text("Type the buy-in amount (e.g. 20):")
+            return
+
+        buy_in = float(buyin_str)
+        host_name = name
+
+        game["active"] = True
+        game["host_id"] = uid
+        game["host_name"] = host_name
+        game["buy_in_amount"] = buy_in
+        game["players"] = {}
+        game["pending"] = []
+        game["winners"] = {}
+        game["rebuy_locked"] = False
+        game["lobby_message_id"] = None
+        game["started_at"] = datetime.now().isoformat()
+        game["game_name"] = generate_game_name(game)
+
+        host_entry = {"name": host_name, "buy_ins": [buy_in], "eliminated": False}
+        host_nick = game.get("nicknames", {}).get(uid)
+        if host_nick:
+            host_entry["nickname"] = host_nick
+        game["players"][uid] = host_entry
+        save_data(data)
+
+        await query.edit_message_text(
+            f"\U0001f3b0 TOURNAMENT STARTED!\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+            f"\U0001f3af {game['game_name']}\n\n"
+            f"Host: {display_name(host_entry)}\n"
+            f"Buy-in: ${buy_in:.2f}\n"
+            f"{display_name(host_entry)} (host) is automatically in.\n"
+        )
+        await update_host_panel(game, chat_id, context)
+        return
+
     # ── End Game Confirmation ─────────────────────────────────────────
     if cb_data == "endgame_record_winners":
         if not is_host(game, uid):
@@ -1725,9 +1779,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if game.get("active"):
                 await query.message.reply_text("A tournament is already running!")
                 return
-            game["awaiting_newgame"] = {"user_id": uid, "name": name}
-            save_data(data)
-            await query.message.reply_text("Type the buy-in amount (e.g. 20):")
+            await query.message.reply_text(
+                "Select buy-in amount:",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("$50", callback_data="newgame_buyin_50"),
+                        InlineKeyboardButton("$100", callback_data="newgame_buyin_100"),
+                    ],
+                    [
+                        InlineKeyboardButton("$200", callback_data="newgame_buyin_200"),
+                        InlineKeyboardButton("$300", callback_data="newgame_buyin_300"),
+                    ],
+                    [InlineKeyboardButton("Custom Amount", callback_data="newgame_buyin_custom")],
+                ]),
+            )
             return
 
         if cb_data == "host_history":
@@ -1913,6 +1978,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_host_panel(game, chat_id, context)
             return
 
+        if cb_data == "host_addplayer":
+            if not game.get("active"):
+                await query.message.reply_text("No active game.")
+                return
+            nicknames = game.get("nicknames", {})
+            available = [
+                (pid, nick) for pid, nick in nicknames.items()
+                if pid not in game["players"]
+            ]
+            if not available:
+                await query.message.reply_text("No known players available to add. All nicknamed players are already in the game.")
+                return
+            buttons = [
+                [InlineKeyboardButton(nick, callback_data=f"hadp_{pid}")]
+                for pid, nick in sorted(available, key=lambda x: x[1].lower())
+            ]
+            await query.message.reply_text(
+                "Select a player to add:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            await update_host_panel(game, chat_id, context)
+            return
+
+        if cb_data == "host_addrebuy":
+            if not game.get("active"):
+                await query.message.reply_text("No active game.")
+                return
+            if not game["players"]:
+                await query.message.reply_text("No players in the game yet.")
+                return
+            buttons = [
+                [InlineKeyboardButton(display_name(p), callback_data=f"hadr_{pid}")]
+                for pid, p in game["players"].items()
+            ]
+            await query.message.reply_text(
+                "Select a player to add rebuy for:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            await update_host_panel(game, chat_id, context)
+            return
+
         if cb_data == "host_endgame":
             # Check if winners are recorded
             player_count = len(game["players"])
@@ -1996,6 +2102,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_host_panel(game, chat_id, context)
             return
 
+        return
+
+    # ── Host Add Player on Behalf ─────────────────────────────────────────
+    if cb_data.startswith("hadp_"):
+        if not is_host(game, uid):
+            await query.answer("Only the host can do this.", show_alert=True)
+            return
+        await query.answer()
+
+        target_uid = cb_data[5:]
+        nicknames = game.get("nicknames", {})
+        nick = nicknames.get(target_uid)
+        if not nick:
+            await query.edit_message_text("Player not found in nicknames.")
+            return
+        if target_uid in game["players"]:
+            await query.edit_message_text(f"{nick} is already in the game!")
+            return
+        if not game.get("active"):
+            await query.edit_message_text("No active game.")
+            return
+
+        amount = game["buy_in_amount"]
+        game["players"][target_uid] = {
+            "name": nick, "buy_ins": [amount], "eliminated": False, "nickname": nick,
+        }
+        game["pending"].append({
+            "type": "join", "user_id": target_uid, "name": nick,
+            "amount": amount, "status": "approved",
+            "timestamp": datetime.now().isoformat(),
+            "request_id": uuid.uuid4().hex[:8],
+        })
+        save_data(data)
+
+        total_players = len(game["players"])
+        pot = get_total_pot(game)
+        await query.edit_message_text(
+            f"\u2705 HOST ADDED - {nick} joins!\n"
+            f"Buy-in: ${amount:.2f}\n"
+            f"Total Prize Pool: ${pot:.2f} | Players: {total_players}\n"
+            f"Payout: {format_payout_structure(total_players)}"
+        )
+        await update_host_panel(game, chat_id, context)
+        return
+
+    # ── Host Add Rebuy on Behalf ──────────────────────────────────────────
+    if cb_data.startswith("hadr_"):
+        if not is_host(game, uid):
+            await query.answer("Only the host can do this.", show_alert=True)
+            return
+        await query.answer()
+
+        target_uid = cb_data[5:]
+        if target_uid not in game["players"]:
+            await query.edit_message_text("Player not found in the game.")
+            return
+        if not game.get("active"):
+            await query.edit_message_text("No active game.")
+            return
+
+        amount = game["buy_in_amount"]
+        player = game["players"][target_uid]
+        player_name = display_name(player)
+        player["buy_ins"].append(amount)
+        player["eliminated"] = False
+
+        total_in = sum(player["buy_ins"])
+        rebuys = len(player["buy_ins"]) - 1
+        pot = get_total_pot(game)
+
+        game["pending"].append({
+            "type": "rebuy", "user_id": target_uid, "name": player_name,
+            "amount": amount, "status": "approved",
+            "timestamp": datetime.now().isoformat(),
+            "request_id": uuid.uuid4().hex[:8],
+        })
+        save_data(data)
+
+        await query.edit_message_text(
+            f"\u2705 HOST ADDED - {player_name} rebuys ${amount:.2f}\n"
+            f"Total in: ${total_in:.2f} ({rebuys} rebuy{'s' if rebuys > 1 else ''})\n"
+            f"Total Prize Pool: ${pot:.2f}"
+        )
+        await update_host_panel(game, chat_id, context)
         return
 
     # ── Host-only actions below this point ────────────────────────────────
