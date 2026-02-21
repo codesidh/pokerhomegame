@@ -493,6 +493,258 @@ def build_pnl_grid(game: dict):
     return game_labels, player_rows
 
 
+def build_winners_grid(game: dict):
+    """Build a winners-per-game matrix from history.
+
+    Returns (game_labels, place_rows) where:
+      game_labels: list of short game names
+      place_rows: list of (place_label, [(name, net_pnl) or None per game])
+      net_pnl = payout - total_invested (accounts for rebuys)
+    """
+    name_map = build_name_map(game)
+
+    games_to_process = []
+    history = game.get("history", [])
+    for h in history:
+        if h.get("winners"):
+            games_to_process.append(h)
+
+    if game.get("active") and game.get("winners"):
+        player_count = len(game.get("players", {}))
+        payout_struct = get_payout_structure(player_count)
+        if len(game["winners"]) >= len(payout_struct):
+            pot = get_total_pot(game)
+            active_summary = {
+                "date": game.get("started_at"),
+                "game_name": game.get("game_name") or "Current Game",
+                "pot": pot,
+                "players": {
+                    display_name(p): {"in": sum(p["buy_ins"]), "rebuys": len(p["buy_ins"]) - 1}
+                    for p in game["players"].values()
+                },
+                "winners": {
+                    place: {"name": w["name"], "payout": w["payout"],
+                            "pct": int(w["percentage"] * 100)}
+                    for place, w in game["winners"].items()
+                },
+            }
+            games_to_process.append(active_summary)
+
+    if not games_to_process:
+        return [], []
+
+    game_labels = []
+    for i, g in enumerate(games_to_process, 1):
+        date_str = g.get("date", "")[:10] if g.get("date") else ""
+        if date_str:
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                label = f"G{i} {dt.strftime('%b%d')}"
+            except ValueError:
+                label = f"G{i}"
+        else:
+            label = f"G{i}"
+        game_labels.append(label)
+
+    # Find max places across all games
+    max_places = 0
+    for g in games_to_process:
+        for place_str in g.get("winners", {}):
+            try:
+                max_places = max(max_places, int(place_str))
+            except ValueError:
+                pass
+
+    place_labels_map = {1: "1st", 2: "2nd", 3: "3rd"}
+    place_rows = []
+    for place in range(1, max_places + 1):
+        label = place_labels_map.get(place, f"{place}th")
+        row = []
+        for g in games_to_process:
+            w = g.get("winners", {}).get(str(place))
+            if w:
+                canonical = name_map.get(w["name"], w["name"])
+                # Calculate net P&L: payout - total invested
+                total_in = 0
+                players_data = g.get("players", {})
+                for pname, pdata in players_data.items():
+                    p_canonical = name_map.get(pname, pname)
+                    if p_canonical == canonical:
+                        total_in = pdata.get("in", 0)
+                        break
+                net = w["payout"] - total_in
+                row.append((canonical, net))
+            else:
+                row.append(None)
+        place_rows.append((label, row))
+
+    return game_labels, place_rows
+
+
+def generate_winners_grid_image(game_labels, place_rows):
+    """Render the winners grid as a polished dark-themed PNG image. Returns BytesIO."""
+    bg_color = (25, 25, 35)
+    header_bg = (40, 40, 58)
+    border_color = (60, 60, 80)
+    text_header = (180, 180, 200)
+    text_gray = (90, 90, 110)
+    text_green = (80, 220, 100)
+    text_red = (240, 80, 80)
+
+    # Distinct row backgrounds + text colors per place
+    row_styles = [
+        {"bg": (50, 45, 20), "name": (255, 215, 50), "medal": "1st", "accent": (80, 70, 15)},   # gold
+        {"bg": (40, 42, 50), "name": (190, 200, 220), "medal": "2nd", "accent": (55, 58, 70)},   # silver
+        {"bg": (45, 35, 25), "name": (220, 160, 80), "medal": "3rd", "accent": (65, 48, 25)},    # bronze
+    ]
+    default_style = {"bg": (35, 35, 48), "name": (200, 200, 210), "medal": "", "accent": (45, 45, 60)}
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+        font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
+        font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 11)
+        font_medal = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 15)
+    except (OSError, IOError):
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 14)
+            font_bold = font
+            font_header = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 13)
+            font_small = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 11)
+            font_medal = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 15)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+            font_bold = font
+            font_header = font
+            font_small = font
+            font_medal = font
+
+    padding = 10
+    cell_h = 44  # taller rows for name + net P&L
+    place_col_w = 70
+    game_col_w = 120
+
+    tmp_img = Image.new("RGB", (1, 1))
+    tmp_draw = ImageDraw.Draw(tmp_img)
+
+    # Measure game column widths
+    for label in game_labels:
+        bbox = tmp_draw.textbbox((0, 0), label, font=font_header)
+        game_col_w = max(game_col_w, bbox[2] - bbox[0] + 24)
+    for _, row in place_rows:
+        for cell in row:
+            if cell:
+                name, net = cell
+                bbox = tmp_draw.textbbox((0, 0), name, font=font_bold)
+                game_col_w = max(game_col_w, bbox[2] - bbox[0] + 24)
+                if net > 0.01:
+                    sample = f"+${net:.0f}"
+                elif net < -0.01:
+                    sample = f"-${abs(net):.0f}"
+                else:
+                    sample = "$0"
+                bbox = tmp_draw.textbbox((0, 0), sample, font=font_small)
+                game_col_w = max(game_col_w, bbox[2] - bbox[0] + 24)
+
+    num_games = len(game_labels)
+    img_w = padding + place_col_w + num_games * game_col_w + padding
+    img_h = padding + cell_h + len(place_rows) * cell_h + padding
+
+    img = Image.new("RGB", (img_w, img_h), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # Header row
+    y = padding
+    draw.rectangle([0, y, img_w, y + cell_h], fill=header_bg)
+    x = padding
+    hdr = "WINNERS"
+    bbox = draw.textbbox((0, 0), hdr, font=font_header)
+    draw.text((x + 4, y + 13), hdr, font=font_header, fill=text_header)
+    x += place_col_w
+
+    for label in game_labels:
+        bbox = draw.textbbox((0, 0), label, font=font_header)
+        tw = bbox[2] - bbox[0]
+        draw.text((x + (game_col_w - tw) // 2, y + 13), label, font=font_header, fill=text_header)
+        x += game_col_w
+
+    draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=2)
+
+    # Medal symbols (text-based, work on all systems)
+    medal_symbols = {0: "\u2605", 1: "\u2606", 2: "\u2662"}  # filled star, empty star, diamond
+
+    # Place rows
+    for ri, (place_label, row) in enumerate(place_rows):
+        style = row_styles[ri] if ri < len(row_styles) else default_style
+        y = padding + cell_h + ri * cell_h
+
+        # Row background
+        draw.rectangle([0, y, img_w, y + cell_h], fill=style["bg"])
+
+        # Subtle accent stripe on the left edge of place column
+        draw.rectangle([0, y, 4, y + cell_h], fill=style["name"])
+
+        x = padding
+        # Place label with medal-style rendering
+        draw.text((x + 8, y + 13), place_label, font=font_medal, fill=style["name"])
+        x += place_col_w
+
+        for cell in row:
+            if cell is None:
+                txt = "---"
+                bbox = draw.textbbox((0, 0), txt, font=font)
+                tw = bbox[2] - bbox[0]
+                draw.text((x + (game_col_w - tw) // 2, y + 13), txt, font=font, fill=text_gray)
+            else:
+                name, net = cell
+                # Winner name - centered, bold, in place color
+                bbox = draw.textbbox((0, 0), name, font=font_bold)
+                tw = bbox[2] - bbox[0]
+                draw.text((x + (game_col_w - tw) // 2, y + 5), name, font=font_bold, fill=style["name"])
+
+                # Net P&L below name - green for profit, red for loss
+                if net > 0.01:
+                    net_txt = f"+${net:.0f}"
+                    net_color = text_green
+                elif net < -0.01:
+                    net_txt = f"-${abs(net):.0f}"
+                    net_color = text_red
+                else:
+                    net_txt = "$0"
+                    net_color = text_gray
+                bbox = draw.textbbox((0, 0), net_txt, font=font_small)
+                tw = bbox[2] - bbox[0]
+                # Small pill background for the net amount
+                tx = x + (game_col_w - tw) // 2
+                if net > 0.01:
+                    pill_bg = (25, 60, 30)
+                elif net < -0.01:
+                    pill_bg = (60, 25, 25)
+                else:
+                    pill_bg = None
+                if pill_bg:
+                    draw.rounded_rectangle(
+                        [tx - 4, y + 24, tx + tw + 4, y + cell_h - 4],
+                        radius=3, fill=pill_bg,
+                    )
+                draw.text((tx, y + 25), net_txt, font=font_small, fill=net_color)
+            x += game_col_w
+
+        draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=1)
+
+    # Vertical separators
+    x = padding + place_col_w
+    draw.line([x, padding, x, img_h - padding], fill=border_color, width=1)
+    for _ in game_labels:
+        x += game_col_w
+        draw.line([x, padding, x, img_h - padding], fill=border_color, width=1)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
 def generate_pnl_grid_image(game_labels, player_rows):
     """Render the P&L grid as a dark-themed PNG image. Returns a BytesIO buffer."""
     # Theme colors
@@ -1564,6 +1816,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not game_labels:
                 await query.message.reply_text("No completed games yet. Play some poker first!")
                 return
+            wl, wr = build_winners_grid(game)
+            if wl and wr:
+                winners_buf = generate_winners_grid_image(wl, wr)
+                await context.bot.send_photo(chat_id=int(chat_id), photo=winners_buf)
             img_buf = generate_pnl_grid_image(game_labels, player_rows)
             await context.bot.send_photo(chat_id=int(chat_id), photo=img_buf)
             return
@@ -2661,6 +2917,10 @@ async def pnlgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No completed games yet. Play some poker first!")
         return
 
+    wl, wr = build_winners_grid(game)
+    if wl and wr:
+        winners_buf = generate_winners_grid_image(wl, wr)
+        await context.bot.send_photo(chat_id=int(chat_id), photo=winners_buf)
     img_buf = generate_pnl_grid_image(game_labels, player_rows)
     await context.bot.send_photo(chat_id=int(chat_id), photo=img_buf)
 
