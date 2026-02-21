@@ -582,161 +582,149 @@ def build_winners_grid(game: dict):
 
 
 def generate_winners_grid_image(game_labels, place_rows):
-    """Render the winners grid as a polished dark-themed PNG image. Returns BytesIO."""
+    """Render the winners grid (games as rows, places as columns). Returns BytesIO."""
     bg_color = (25, 25, 35)
     header_bg = (40, 40, 58)
+    row_even = (35, 35, 48)
+    row_odd = (40, 40, 55)
     border_color = (60, 60, 80)
     text_header = (180, 180, 200)
+    text_white = (220, 220, 230)
     text_gray = (90, 90, 110)
     text_green = (80, 220, 100)
     text_red = (240, 80, 80)
 
-    # Distinct row backgrounds + text colors per place
-    row_styles = [
-        {"bg": (50, 45, 20), "name": (255, 215, 50), "medal": "1st", "accent": (80, 70, 15)},   # gold
-        {"bg": (40, 42, 50), "name": (190, 200, 220), "medal": "2nd", "accent": (55, 58, 70)},   # silver
-        {"bg": (45, 35, 25), "name": (220, 160, 80), "medal": "3rd", "accent": (65, 48, 25)},    # bronze
+    # Column styles per place
+    col_styles = [
+        {"name": (255, 215, 50), "header_bg": (55, 50, 20)},    # gold
+        {"name": (190, 200, 220), "header_bg": (45, 47, 58)},   # silver
+        {"name": (220, 160, 80), "header_bg": (50, 40, 25)},    # bronze
     ]
-    default_style = {"bg": (35, 35, 48), "name": (200, 200, 210), "medal": "", "accent": (45, 45, 60)}
+    default_col = {"name": (200, 200, 210), "header_bg": header_bg}
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
         font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
         font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 11)
-        font_medal = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 15)
     except (OSError, IOError):
         try:
             font = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 14)
             font_bold = font
             font_header = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 13)
             font_small = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 11)
-            font_medal = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 15)
         except (OSError, IOError):
             font = ImageFont.load_default()
             font_bold = font
             font_header = font
             font_small = font
-            font_medal = font
 
     padding = 10
-    cell_h = 44  # taller rows for name + net P&L
-    place_col_w = 70
-    game_col_w = 120
+    cell_h = 44  # taller for name + net P&L
+    game_label_w = 100
+    place_col_w = 130
+
+    num_places = len(place_rows)
+    num_games = len(game_labels)
 
     tmp_img = Image.new("RGB", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_img)
 
-    # Measure game column widths
+    # Measure game label column
     for label in game_labels:
-        bbox = tmp_draw.textbbox((0, 0), label, font=font_header)
-        game_col_w = max(game_col_w, bbox[2] - bbox[0] + 24)
+        bbox = tmp_draw.textbbox((0, 0), label, font=font_bold)
+        game_label_w = max(game_label_w, bbox[2] - bbox[0] + 20)
+
+    # Measure place column widths based on winner names
     for _, row in place_rows:
         for cell in row:
             if cell:
                 name, net = cell
                 bbox = tmp_draw.textbbox((0, 0), name, font=font_bold)
-                game_col_w = max(game_col_w, bbox[2] - bbox[0] + 24)
-                if net > 0.01:
-                    sample = f"+${net:.0f}"
-                elif net < -0.01:
-                    sample = f"-${abs(net):.0f}"
-                else:
-                    sample = "$0"
-                bbox = tmp_draw.textbbox((0, 0), sample, font=font_small)
-                game_col_w = max(game_col_w, bbox[2] - bbox[0] + 24)
+                place_col_w = max(place_col_w, bbox[2] - bbox[0] + 24)
 
-    num_games = len(game_labels)
-    img_w = padding + place_col_w + num_games * game_col_w + padding
-    img_h = padding + cell_h + len(place_rows) * cell_h + padding
+    img_w = padding + game_label_w + num_places * place_col_w + padding
+    img_h = padding + cell_h + num_games * cell_h + padding
 
     img = Image.new("RGB", (img_w, img_h), bg_color)
     draw = ImageDraw.Draw(img)
 
-    # Header row
+    # ── Header row: GAME | 1st | 2nd | 3rd ──
     y = padding
-    draw.rectangle([0, y, img_w, y + cell_h], fill=header_bg)
+    draw.rectangle([0, y, padding + game_label_w, y + cell_h], fill=header_bg)
     x = padding
-    hdr = "WINNERS"
-    bbox = draw.textbbox((0, 0), hdr, font=font_header)
-    draw.text((x + 4, y + 13), hdr, font=font_header, fill=text_header)
-    x += place_col_w
+    draw.text((x + 4, y + 13), "GAME", font=font_header, fill=text_header)
+    x += game_label_w
 
-    for label in game_labels:
-        bbox = draw.textbbox((0, 0), label, font=font_header)
+    place_labels = {0: "\U0001f947 1st", 1: "\U0001f948 2nd", 2: "\U0001f949 3rd"}
+    for pi, (place_label, _) in enumerate(place_rows):
+        style = col_styles[pi] if pi < len(col_styles) else default_col
+        draw.rectangle([x, y, x + place_col_w, y + cell_h], fill=style["header_bg"])
+        hdr_text = place_labels.get(pi, place_label)
+        bbox = draw.textbbox((0, 0), hdr_text, font=font_header)
         tw = bbox[2] - bbox[0]
-        draw.text((x + (game_col_w - tw) // 2, y + 13), label, font=font_header, fill=text_header)
-        x += game_col_w
+        draw.text((x + (place_col_w - tw) // 2, y + 13), hdr_text, font=font_header, fill=style["name"])
+        x += place_col_w
 
     draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=2)
 
-    # Medal symbols (text-based, work on all systems)
-    medal_symbols = {0: "\u2605", 1: "\u2606", 2: "\u2662"}  # filled star, empty star, diamond
-
-    # Place rows
-    for ri, (place_label, row) in enumerate(place_rows):
-        style = row_styles[ri] if ri < len(row_styles) else default_style
-        y = padding + cell_h + ri * cell_h
-
-        # Row background
-        draw.rectangle([0, y, img_w, y + cell_h], fill=style["bg"])
-
-        # Subtle accent stripe on the left edge of place column
-        draw.rectangle([0, y, 4, y + cell_h], fill=style["name"])
+    # ── Game rows ──
+    for gi, label in enumerate(game_labels):
+        y = padding + cell_h + gi * cell_h
+        row_bg = row_even if gi % 2 == 0 else row_odd
+        draw.rectangle([0, y, img_w, y + cell_h], fill=row_bg)
 
         x = padding
-        # Place label with medal-style rendering
-        draw.text((x + 8, y + 13), place_label, font=font_medal, fill=style["name"])
-        x += place_col_w
+        draw.text((x + 4, y + 13), label, font=font_bold, fill=text_white)
+        x += game_label_w
 
-        for cell in row:
+        for pi, (_, row) in enumerate(place_rows):
+            style = col_styles[pi] if pi < len(col_styles) else default_col
+            cell = row[gi] if gi < len(row) else None
+
             if cell is None:
                 txt = "---"
                 bbox = draw.textbbox((0, 0), txt, font=font)
                 tw = bbox[2] - bbox[0]
-                draw.text((x + (game_col_w - tw) // 2, y + 13), txt, font=font, fill=text_gray)
+                draw.text((x + (place_col_w - tw) // 2, y + 13), txt, font=font, fill=text_gray)
             else:
                 name, net = cell
-                # Winner name - centered, bold, in place color
+                # Winner name in place color
                 bbox = draw.textbbox((0, 0), name, font=font_bold)
                 tw = bbox[2] - bbox[0]
-                draw.text((x + (game_col_w - tw) // 2, y + 5), name, font=font_bold, fill=style["name"])
+                draw.text((x + (place_col_w - tw) // 2, y + 5), name, font=font_bold, fill=style["name"])
 
-                # Net P&L below name - green for profit, red for loss
+                # Net P&L below
                 if net > 0.01:
                     net_txt = f"+${net:.0f}"
                     net_color = text_green
+                    pill_bg = (25, 60, 30)
                 elif net < -0.01:
                     net_txt = f"-${abs(net):.0f}"
                     net_color = text_red
+                    pill_bg = (60, 25, 25)
                 else:
                     net_txt = "$0"
                     net_color = text_gray
+                    pill_bg = None
                 bbox = draw.textbbox((0, 0), net_txt, font=font_small)
                 tw = bbox[2] - bbox[0]
-                # Small pill background for the net amount
-                tx = x + (game_col_w - tw) // 2
-                if net > 0.01:
-                    pill_bg = (25, 60, 30)
-                elif net < -0.01:
-                    pill_bg = (60, 25, 25)
-                else:
-                    pill_bg = None
+                tx = x + (place_col_w - tw) // 2
                 if pill_bg:
                     draw.rounded_rectangle(
                         [tx - 4, y + 24, tx + tw + 4, y + cell_h - 4],
                         radius=3, fill=pill_bg,
                     )
                 draw.text((tx, y + 25), net_txt, font=font_small, fill=net_color)
-            x += game_col_w
+            x += place_col_w
 
         draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=1)
 
-    # Vertical separators
-    x = padding + place_col_w
+    # ── Vertical separators ──
+    x = padding + game_label_w
     draw.line([x, padding, x, img_h - padding], fill=border_color, width=1)
-    for _ in game_labels:
-        x += game_col_w
+    for pi in range(num_places):
+        x += place_col_w
         draw.line([x, padding, x, img_h - padding], fill=border_color, width=1)
 
     buf = io.BytesIO()
@@ -746,10 +734,12 @@ def generate_winners_grid_image(game_labels, place_rows):
 
 
 def generate_pnl_grid_image(game_labels, player_rows):
-    """Render the P&L grid as a dark-themed PNG image. Returns a BytesIO buffer."""
+    """Render the P&L grid as a dark-themed PNG image (games as rows, players as columns).
+    Returns a BytesIO buffer."""
     # Theme colors
     bg_color = (30, 30, 40)
     header_bg = (45, 45, 60)
+    total_row_bg = (50, 50, 65)
     row_even = (35, 35, 48)
     row_odd = (40, 40, 55)
     border_color = (70, 70, 90)
@@ -758,48 +748,43 @@ def generate_pnl_grid_image(game_labels, player_rows):
     text_red = (240, 80, 80)
     text_gray = (100, 100, 120)
     text_header = (180, 180, 200)
-    accent_green = (40, 180, 70)
-    accent_red = (200, 50, 50)
 
-    text_rebuy = (180, 160, 80)  # muted yellow for rebuy indicator
-
-    # Use default font (monospace-like)
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
         font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
         font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10)
     except (OSError, IOError):
         try:
             font = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 14)
             font_bold = font
             font_header = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 13)
-            font_small = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 10)
         except (OSError, IOError):
             font = ImageFont.load_default()
             font_bold = font
             font_header = font
-            font_small = font
 
-    # Calculate dimensions
     padding = 10
     cell_h = 28
-    name_col_w = 120
-    game_col_w = 80
-    total_col_w = 90
+    game_col_w = 100  # left column for game labels
+    player_col_w = 100  # each player column
 
-    # Measure name column width to fit longest name
+    num_players = len(player_rows)
+    num_games = len(game_labels)
+
     tmp_img = Image.new("RGB", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_img)
-    for name, _, _, _ in player_rows:
-        bbox = tmp_draw.textbbox((0, 0), name, font=font_bold)
-        name_col_w = max(name_col_w, bbox[2] - bbox[0] + 20)
 
-    # Measure game column widths (account for rebuy labels like "+$400 (R3)")
+    # Measure game label column width
     for label in game_labels:
-        bbox = tmp_draw.textbbox((0, 0), label, font=font_header)
+        bbox = tmp_draw.textbbox((0, 0), label, font=font_bold)
         game_col_w = max(game_col_w, bbox[2] - bbox[0] + 20)
-    for _, pnls, _, rebuys in player_rows:
+    bbox = tmp_draw.textbbox((0, 0), "TOTAL", font=font_bold)
+    game_col_w = max(game_col_w, bbox[2] - bbox[0] + 20)
+
+    # Measure player column widths (fit names and values like "+$400 (R3)")
+    for name, pnls, _, rebuys in player_rows:
+        bbox = tmp_draw.textbbox((0, 0), name, font=font_header)
+        player_col_w = max(player_col_w, bbox[2] - bbox[0] + 20)
         for pnl, rb in zip(pnls, rebuys):
             if pnl is None:
                 continue
@@ -813,47 +798,42 @@ def generate_pnl_grid_image(game_labels, player_rows):
             if rb_count > 0:
                 sample += f" (R{rb_count})"
             bbox = tmp_draw.textbbox((0, 0), sample, font=font)
-            game_col_w = max(game_col_w, bbox[2] - bbox[0] + 16)
+            player_col_w = max(player_col_w, bbox[2] - bbox[0] + 16)
 
-    num_games = len(game_labels)
-    img_w = padding + name_col_w + num_games * game_col_w + total_col_w + padding
-    img_h = padding + cell_h + len(player_rows) * cell_h + padding  # header + rows
+    # +1 row for TOTAL at the bottom
+    img_w = padding + game_col_w + num_players * player_col_w + padding
+    img_h = padding + cell_h + num_games * cell_h + cell_h + padding  # header + game rows + total row
 
     img = Image.new("RGB", (img_w, img_h), bg_color)
     draw = ImageDraw.Draw(img)
 
-    # Draw header row
+    # ── Header row: GAME | Player1 | Player2 | ... ──
     y = padding
     draw.rectangle([0, y, img_w, y + cell_h], fill=header_bg)
-
     x = padding
-    draw.text((x + 4, y + 6), "PLAYER", font=font_header, fill=text_header)
-    x += name_col_w
+    draw.text((x + 4, y + 6), "GAME", font=font_header, fill=text_header)
+    x += game_col_w
 
-    for label in game_labels:
-        bbox = draw.textbbox((0, 0), label, font=font_header)
+    for name, _, _, _ in player_rows:
+        bbox = draw.textbbox((0, 0), name, font=font_header)
         tw = bbox[2] - bbox[0]
-        draw.text((x + (game_col_w - tw) // 2, y + 6), label, font=font_header, fill=text_header)
-        x += game_col_w
+        draw.text((x + (player_col_w - tw) // 2, y + 6), name, font=font_header, fill=text_header)
+        x += player_col_w
 
-    bbox = draw.textbbox((0, 0), "TOTAL", font=font_header)
-    tw = bbox[2] - bbox[0]
-    draw.text((x + (total_col_w - tw) // 2, y + 6), "TOTAL", font=font_header, fill=text_header)
-
-    # Draw header bottom border
     draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=2)
 
-    # Draw player rows
-    for ri, (name, pnls, total, rebuys) in enumerate(player_rows):
-        y = padding + cell_h + ri * cell_h
-        row_bg = row_even if ri % 2 == 0 else row_odd
+    # ── Game rows ──
+    for gi, label in enumerate(game_labels):
+        y = padding + cell_h + gi * cell_h
+        row_bg = row_even if gi % 2 == 0 else row_odd
         draw.rectangle([0, y, img_w, y + cell_h], fill=row_bg)
 
         x = padding
-        draw.text((x + 4, y + 6), name, font=font_bold, fill=text_white)
-        x += name_col_w
+        draw.text((x + 4, y + 6), label, font=font_bold, fill=text_white)
+        x += game_col_w
 
-        for gi, pnl in enumerate(pnls):
+        for name, pnls, _, rebuys in player_rows:
+            pnl = pnls[gi]
             rb = rebuys[gi] if rebuys[gi] is not None else 0
             if pnl is None:
                 txt = "---"
@@ -875,11 +855,21 @@ def generate_pnl_grid_image(game_labels, player_rows):
                 color = text_gray
             bbox = draw.textbbox((0, 0), txt, font=font)
             tw = bbox[2] - bbox[0]
-            tx = x + (game_col_w - tw) // 2
-            draw.text((tx, y + 6), txt, font=font, fill=color)
-            x += game_col_w
+            draw.text((x + (player_col_w - tw) // 2, y + 6), txt, font=font, fill=color)
+            x += player_col_w
 
-        # Total column with accent background
+        draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=1)
+
+    # ── TOTAL row ──
+    y = padding + cell_h + num_games * cell_h
+    draw.rectangle([0, y, img_w, y + cell_h], fill=total_row_bg)
+    draw.line([0, y, img_w, y], fill=border_color, width=2)
+
+    x = padding
+    draw.text((x + 4, y + 6), "TOTAL", font=font_bold, fill=text_header)
+    x += game_col_w
+
+    for name, _, total, _ in player_rows:
         if total > 0.01:
             total_txt = f"+${total:.0f}"
             total_color = text_green
@@ -895,7 +885,7 @@ def generate_pnl_grid_image(game_labels, player_rows):
 
         bbox = draw.textbbox((0, 0), total_txt, font=font_bold)
         tw = bbox[2] - bbox[0]
-        tx = x + (total_col_w - tw) // 2
+        tx = x + (player_col_w - tw) // 2
 
         if pill_color:
             draw.rounded_rectangle(
@@ -903,15 +893,15 @@ def generate_pnl_grid_image(game_labels, player_rows):
                 radius=4, fill=pill_color,
             )
         draw.text((tx, y + 6), total_txt, font=font_bold, fill=total_color)
+        x += player_col_w
 
-        # Row separator
-        draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=1)
+    draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=1)
 
-    # Vertical separators
-    x = padding + name_col_w
+    # ── Vertical separators ──
+    x = padding + game_col_w
     draw.line([x, padding, x, img_h - padding], fill=border_color, width=1)
-    for _ in game_labels:
-        x += game_col_w
+    for _ in player_rows:
+        x += player_col_w
         draw.line([x, padding, x, img_h - padding], fill=border_color, width=1)
 
     buf = io.BytesIO()
