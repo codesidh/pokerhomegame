@@ -1099,13 +1099,25 @@ async def update_lobby(game: dict, chat_id: str, context: ContextTypes.DEFAULT_T
 
 
 def host_panel_keyboard(game: dict) -> InlineKeyboardMarkup:
+    if not game.get("active"):
+        # Inactive state: minimal panel
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f3ae New Game", callback_data="host_newgame")],
+            [
+                InlineKeyboardButton("\U0001f3af P&L Grid", callback_data="host_pnlgrid"),
+                InlineKeyboardButton("\U0001f3c6 Leaderboard", callback_data="host_leaderboard"),
+            ],
+            [InlineKeyboardButton("\U0001f4da History", callback_data="host_history")],
+        ])
+
+    # Active state: full controls + player buttons at bottom
     rebuy_locked = game.get("rebuy_locked", False)
     if rebuy_locked:
         rebuy_btn = InlineKeyboardButton("\U0001f513 Unlock Rebuy", callback_data="host_unlockrebuy")
     else:
         rebuy_btn = InlineKeyboardButton("\U0001f512 Lock Rebuy", callback_data="host_lockrebuy")
 
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("\U0001f4ca Status", callback_data="host_status"),
             rebuy_btn,
@@ -1121,10 +1133,25 @@ def host_panel_keyboard(game: dict) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("\U0001f3af P&L Grid", callback_data="host_pnlgrid"),
         ],
-    ])
+    ]
+
+    # Player buttons at the bottom
+    player_row = [InlineKeyboardButton("Join Game", callback_data="lobby_join")]
+    if not rebuy_locked:
+        player_row.append(InlineKeyboardButton("Rebuy", callback_data="lobby_rebuy"))
+    rows.append(player_row)
+
+    return InlineKeyboardMarkup(rows)
 
 
 def host_panel_text(game: dict) -> str:
+    if not game.get("active"):
+        return (
+            "\U0001f3ae POKER NIGHT\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+            "No active game. Start a new game or view past results."
+        )
+
     player_count = len(game["players"])
     pot = get_total_pot(game)
     rebuy_status = "CLOSED" if game.get("rebuy_locked") else "OPEN"
@@ -1147,7 +1174,25 @@ def host_panel_text(game: dict) -> str:
         text += f"\u23f3 Pending requests: {pending_count}\n"
     if winners_recorded > 0:
         text += f"\U0001f3c6 Winners: {winners_recorded}/{winners_needed} recorded\n"
-    text += "\nUse the buttons below to manage the game."
+
+    # Lobby info merged in
+    text += f"\nBuy-in: ${game['buy_in_amount']:.2f}\n"
+    if game.get("rebuy_locked"):
+        place_emojis = {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949"}
+        text += "\U0001f3c6 Payouts:\n"
+        for place, pct in payout_struct.items():
+            emoji = place_emojis.get(place, "")
+            text += f"  {emoji} ${pot * pct:.2f} ({int(pct * 100)}%)\n"
+    else:
+        text += f"{format_payout_structure(player_count)}\n"
+
+    text += f"\nPlayers:\n{player_summary(game)}\n\n"
+
+    if game.get("rebuy_locked"):
+        text += "Tap 'Join Game' to enter."
+    else:
+        text += "Tap 'Join Game' to enter or 'Rebuy' for more chips."
+
     return text
 
 
@@ -1215,6 +1260,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
+    # Post inactive host panel if none exists and no active game
+    chat_id = str(update.effective_chat.id)
+    data = load_data()
+    game = get_game(chat_id, data)
+    if not game.get("host_panel_message_id") and not game.get("active"):
+        panel_msg = await update.message.reply_text(
+            host_panel_text(game),
+            reply_markup=host_panel_keyboard(game),
+        )
+        game["host_panel_message_id"] = panel_msg.message_id
+        save_data(data)
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
@@ -1264,6 +1321,7 @@ async def newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["lobby_message_id"] = None
     game["started_at"] = datetime.now().isoformat()
     game["game_name"] = custom_name or generate_game_name(game)
+    game.pop("awaiting_newgame", None)
 
     # Auto-add host (with persistent nickname if set, lookup by user_id)
     host_entry = {"name": name, "buy_ins": [buy_in], "eliminated": False}
@@ -1282,17 +1340,15 @@ async def newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{name} (host) is automatically in.\n"
     )
 
-    lobby_msg = await update.message.reply_text(
-        lobby_text(game),
-        reply_markup=lobby_keyboard(False),
-    )
-    game["lobby_message_id"] = lobby_msg.message_id
-
-    host_msg = await update.message.reply_text(
-        host_panel_text(game),
-        reply_markup=host_panel_keyboard(game),
-    )
-    game["host_panel_message_id"] = host_msg.message_id
+    # Post or refresh host panel (which now includes lobby)
+    if game.get("host_panel_message_id"):
+        await update_host_panel(game, chat_id, context)
+    else:
+        host_msg = await update.message.reply_text(
+            host_panel_text(game),
+            reply_markup=host_panel_keyboard(game),
+        )
+        game["host_panel_message_id"] = host_msg.message_id
     save_data(data)
 
 
@@ -1318,7 +1374,6 @@ async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     removed = game["players"].pop(target_id)
                     save_data(data)
                     await update.message.reply_text(f"{removed['name']} has been removed.")
-                    await update_lobby(game, chat_id, context)
                     await update_host_panel(game, chat_id, context)
                     return
 
@@ -1329,7 +1384,6 @@ async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 removed = game["players"].pop(pid)
                 save_data(data)
                 await update.message.reply_text(f"{removed['name']} has been removed.")
-                await update_lobby(game, chat_id, context)
                 await update_host_panel(game, chat_id, context)
                 return
 
@@ -1389,7 +1443,6 @@ async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 game["nicknames"][pid] = nickname
                 save_data(data)
                 await update.message.reply_text(f"Nickname set: {old_display} \u27a1 {nickname}")
-                await update_lobby(game, chat_id, context)
                 await update_host_panel(game, chat_id, context)
                 found = True
                 break
@@ -1418,7 +1471,6 @@ async def lockrebuy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["rebuy_locked"] = True
     save_data(data)
     await update.message.reply_text("Rebuys are now CLOSED.")
-    await update_lobby(game, chat_id, context)
     await update_host_panel(game, chat_id, context)
 
 
@@ -1439,7 +1491,6 @@ async def unlockrebuy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["rebuy_locked"] = False
     save_data(data)
     await update.message.reply_text("Rebuys are now OPEN.")
-    await update_lobby(game, chat_id, context)
     await update_host_panel(game, chat_id, context)
 
 
@@ -1520,6 +1571,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{game['host_name']}, approve or reject:",
             reply_markup=approval_keyboard(request_id),
         )
+        await update_host_panel(game, chat_id, context)
         return
 
     # ── Lobby: Rebuy Button ───────────────────────────────────────────────
@@ -1555,6 +1607,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{game['host_name']}, approve or reject:",
             reply_markup=approval_keyboard(request_id),
         )
+        await update_host_panel(game, chat_id, context)
         return
 
     # ── End Game Confirmation ─────────────────────────────────────────
@@ -1630,17 +1683,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(game["history"]) > HISTORY_LIMIT:
             game["history"] = game["history"][-HISTORY_LIMIT:]
 
-        # Deactivate host panel
-        if game.get("host_panel_message_id"):
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=game["host_panel_message_id"],
-                    text=f"\U0001f3c1 GAME ENDED\n\n{game_name}\nThis control panel is no longer active.",
-                )
-            except Exception:
-                pass
-
         game["active"] = False
         game["players"] = {}
         game["pending"] = []
@@ -1652,7 +1694,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game["game_name"] = None
         game["rebuy_locked"] = False
         game["lobby_message_id"] = None
-        game["host_panel_message_id"] = None
         save_data(data)
 
         await query.edit_message_text(
@@ -1663,15 +1704,70 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\u26a0\ufe0f Ended without winners.\n"
             f"Archived. Use /reopen to add winners later."
         )
+
+        # Refresh host panel to inactive state
+        await update_host_panel(game, chat_id, context)
         return
 
     # ── Host Panel Buttons ──────────────────────────────────────────────
     if cb_data.startswith("host_"):
-        if not is_host(game, uid):
+        # These buttons are available to everyone
+        public_buttons = {"host_newgame", "host_pnlgrid", "host_history", "host_leaderboard"}
+
+        # Host-only buttons during active game
+        if cb_data not in public_buttons and not is_host(game, uid):
             await query.answer("Only the host can use these controls.", show_alert=True)
             return
 
         await query.answer()
+
+        if cb_data == "host_newgame":
+            if game.get("active"):
+                await query.message.reply_text("A tournament is already running!")
+                return
+            game["awaiting_newgame"] = {"user_id": uid, "name": name}
+            save_data(data)
+            await query.message.reply_text("Type the buy-in amount (e.g. 20):")
+            return
+
+        if cb_data == "host_history":
+            if not game.get("history"):
+                await query.message.reply_text("No past tournaments yet.")
+                return
+            page_size = 10
+            total = len(game["history"])
+            total_pages = (total + page_size - 1) // page_size
+            page = total_pages
+            start_idx = (page - 1) * page_size
+            end_idx = min(start_idx + page_size, total)
+            page_games = game["history"][start_idx:end_idx]
+
+            place_emojis_h = {"1": "\U0001f947", "2": "\U0001f948", "3": "\U0001f949"}
+            hist_text = (
+                f"\U0001f4da TOURNAMENT HISTORY\n"
+                f"Page {page}/{total_pages} ({total} games)\n"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+                f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+            )
+            for i, g in enumerate(page_games, start_idx + 1):
+                gname = g.get("game_name") or f"Game #{i}"
+                hist_text += (
+                    f"\U0001f3af {gname}\n"
+                    f"  Host: {g.get('host', 'N/A')} | "
+                    f"Buy-in: ${g.get('buy_in', 0):.2f}\n"
+                    f"  \U0001f465 {g.get('player_count', '?')} players | "
+                    f"\U0001f4b0 ${g.get('pot', 0):.2f}\n"
+                )
+                if g.get("winners"):
+                    for place, w in sorted(g["winners"].items()):
+                        emoji = place_emojis_h.get(str(place), "  ")
+                        hist_text += f"  {emoji} {w['name']} - ${w['payout']:.2f} ({w['pct']}%)\n"
+                hist_text += "\n"
+            if total_pages > 1:
+                hist_text += f"Use /history <page> to navigate (1-{total_pages})"
+            await query.message.reply_text(hist_text)
+            await update_host_panel(game, chat_id, context)
+            return
 
         if cb_data == "host_status":
             player_count = len(game["players"])
@@ -1713,13 +1809,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text += f"  {emoji} {w['name']} - ${w['payout']:.2f}\n"
 
             await query.message.reply_text(text)
+            await update_host_panel(game, chat_id, context)
             return
 
         if cb_data == "host_lockrebuy":
             game["rebuy_locked"] = True
             save_data(data)
             await query.message.reply_text("\U0001f512 Rebuys are now CLOSED.")
-            await update_lobby(game, chat_id, context)
             await update_host_panel(game, chat_id, context)
             return
 
@@ -1727,7 +1823,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game["rebuy_locked"] = False
             save_data(data)
             await query.message.reply_text("\U0001f513 Rebuys are now OPEN.")
-            await update_lobby(game, chat_id, context)
             await update_host_panel(game, chat_id, context)
             return
 
@@ -1765,6 +1860,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Select {place_label} place:",
                 reply_markup=winner_keyboard(game["players"], start_place, exclude_uids=already_picked),
             )
+            await update_host_panel(game, chat_id, context)
             return
 
         if cb_data == "host_settle":
@@ -1780,6 +1876,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             await query.message.reply_text(format_settle_dashboard(game))
+            await update_host_panel(game, chat_id, context)
             return
 
         if cb_data == "host_leaderboard":
@@ -1799,6 +1896,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("No stats to show yet.")
                 return
             await query.message.reply_text(format_leaderboard(stats, game_count))
+            await update_host_panel(game, chat_id, context)
             return
 
         if cb_data == "host_pnlgrid":
@@ -1812,6 +1910,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_photo(chat_id=int(chat_id), photo=winners_buf)
             img_buf = generate_pnl_grid_image(game_labels, player_rows)
             await context.bot.send_photo(chat_id=int(chat_id), photo=img_buf)
+            await update_host_panel(game, chat_id, context)
             return
 
         if cb_data == "host_endgame":
@@ -1831,6 +1930,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("\U0001f3c1 End Without Winners", callback_data="endgame_confirm")],
                     ]),
                 )
+                await update_host_panel(game, chat_id, context)
                 return
 
             pot = get_total_pot(game)
@@ -1876,21 +1976,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game["game_name"] = None
             game["rebuy_locked"] = False
             game["lobby_message_id"] = None
-            game["host_panel_message_id"] = None
             save_data(data)
 
             winner_lines = ""
             for place, w in sorted(summary["winners"].items()):
                 emoji = place_emojis_e.get(str(place), "  ")
                 winner_lines += f"  {emoji} {w['name']} - ${w['payout']:.2f}\n"
-
-            # Update the host panel to show game over
-            try:
-                await query.edit_message_text(
-                    f"\U0001f3c1 GAME ENDED\n\n{game_name}\nThis control panel is no longer active."
-                )
-            except Exception:
-                pass
 
             await query.message.reply_text(
                 f"\U0001f3c1 TOURNAMENT OVER!\n"
@@ -1900,6 +1991,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"\U0001f3c6 Winners:\n{winner_lines}\n"
                 f"Archived. Use /history to review."
             )
+
+            # Refresh host panel to inactive state
+            await update_host_panel(game, chat_id, context)
             return
 
         return
@@ -2025,6 +2119,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             summary_lines.append("\nUse /settle to see the settlement dashboard.")
             await query.message.reply_text("\n".join(summary_lines))
 
+        await update_host_panel(game, chat_id, context)
         return
 
     # ── Join / Rebuy Approval ─────────────────────────────────────────────
@@ -2089,7 +2184,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Total Prize Pool: ${pot:.2f} | Players: {total_players}\n"
             f"Payout: {format_payout_structure(total_players)}"
         )
-        await update_lobby(game, chat_id, context)
         await update_host_panel(game, chat_id, context)
 
     elif req["type"] == "rebuy":
@@ -2106,7 +2200,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Total in: ${total_in:.2f} ({rebuys} rebuy{'s' if rebuys > 1 else ''})\n"
                 f"Total Prize Pool: ${pot:.2f}"
             )
-            await update_lobby(game, chat_id, context)
             await update_host_panel(game, chat_id, context)
         else:
             await query.edit_message_text(f"{player_name} is not in the tournament.")
@@ -2617,17 +2710,6 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(game["history"]) > HISTORY_LIMIT:
         game["history"] = game["history"][-HISTORY_LIMIT:]
 
-    # Deactivate host panel
-    if game.get("host_panel_message_id"):
-        try:
-            await context.bot.edit_message_text(
-                chat_id=int(chat_id),
-                message_id=game["host_panel_message_id"],
-                text=f"\U0001f3c1 GAME ENDED\n\n{game_name}\nThis control panel is no longer active.",
-            )
-        except Exception:
-            pass
-
     # Reset
     game["active"] = False
     game["players"] = {}
@@ -2640,7 +2722,6 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["game_name"] = None
     game["rebuy_locked"] = False
     game["lobby_message_id"] = None
-    game["host_panel_message_id"] = None
     save_data(data)
 
     winner_lines = ""
@@ -2656,6 +2737,9 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\U0001f3c6 Winners:\n{winner_lines}\n"
         f"Archived. Use /history to review."
     )
+
+    # Refresh host panel to inactive state
+    await update_host_panel(game, chat_id, context)
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2801,31 +2885,84 @@ async def reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Use /settle after recording winners."
     )
 
-    lobby_msg = await update.message.reply_text(
-        lobby_text(game),
-        reply_markup=lobby_keyboard(game.get("rebuy_locked", False)),
-    )
-    game["lobby_message_id"] = lobby_msg.message_id
-
-    host_msg = await update.message.reply_text(
-        host_panel_text(game),
-        reply_markup=host_panel_keyboard(game),
-    )
-    game["host_panel_message_id"] = host_msg.message_id
+    # Post or refresh host panel (which now includes lobby)
+    if game.get("host_panel_message_id"):
+        await update_host_panel(game, chat_id, context)
+    else:
+        host_msg = await update.message.reply_text(
+            host_panel_text(game),
+            reply_markup=host_panel_keyboard(game),
+        )
+        game["host_panel_message_id"] = host_msg.message_id
     save_data(data)
 
 
 # ── Custom Payout Handler ────────────────────────────────────────────────────
 async def handle_custom_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Captures typed dollar amount when host is setting a custom winner payout."""
+    """Captures typed dollar amount for custom winner payout or new game buy-in."""
     chat_id = str(update.effective_chat.id)
     uid = str(update.effective_user.id)
+    user = update.effective_user
 
     data = load_data()
     game = get_game(chat_id, data)
 
+    # Handle new game buy-in amount
+    if game.get("awaiting_newgame"):
+        ang = game["awaiting_newgame"]
+        if ang["user_id"] != uid:
+            return  # Only the user who tapped New Game
+
+        raw = update.message.text.strip().replace("$", "").replace(",", "")
+        try:
+            buy_in = float(raw)
+        except ValueError:
+            await update.message.reply_text("Please type a valid buy-in amount (e.g. 20).")
+            return
+
+        if buy_in <= 0:
+            await update.message.reply_text("Amount must be greater than 0.")
+            return
+
+        host_name = ang["name"]
+        del game["awaiting_newgame"]
+
+        # Start the game (reuse newgame logic)
+        game["active"] = True
+        game["host_id"] = uid
+        game["host_name"] = host_name
+        game["buy_in_amount"] = buy_in
+        game["players"] = {}
+        game["pending"] = []
+        game["winners"] = {}
+        game["rebuy_locked"] = False
+        game["lobby_message_id"] = None
+        game["started_at"] = datetime.now().isoformat()
+        game["game_name"] = generate_game_name(game)
+
+        # Auto-add host (with persistent nickname if set)
+        host_entry = {"name": host_name, "buy_ins": [buy_in], "eliminated": False}
+        host_nick = game.get("nicknames", {}).get(uid)
+        if host_nick:
+            host_entry["nickname"] = host_nick
+        game["players"][uid] = host_entry
+        save_data(data)
+
+        await update.message.reply_text(
+            f"\U0001f3b0 TOURNAMENT STARTED!\n"
+            f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+            f"\U0001f3af {game['game_name']}\n\n"
+            f"Host: {host_name}\n"
+            f"Buy-in: ${buy_in:.2f}\n"
+            f"{host_name} (host) is automatically in.\n"
+        )
+
+        # Refresh the host panel to active state
+        await update_host_panel(game, chat_id, context)
+        return
+
     if not game.get("awaiting_payout"):
-        return  # Not awaiting a payout, ignore
+        return  # Not awaiting anything, ignore
 
     if not is_host(game, uid):
         return  # Only host can set payouts
@@ -2895,6 +3032,8 @@ async def handle_custom_payout(update: Update, context: ContextTypes.DEFAULT_TYP
         summary_lines.append("\nUse /settle to see the settlement dashboard.")
         await update.message.reply_text("\n".join(summary_lines))
 
+    await update_host_panel(game, chat_id, context)
+
 
 async def pnlgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -2905,6 +3044,14 @@ async def pnlgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_labels, player_rows = build_pnl_grid(game)
     if not game_labels:
         await update.message.reply_text("No completed games yet. Play some poker first!")
+        # Still post inactive panel if none exists
+        if not game.get("host_panel_message_id") and not game.get("active"):
+            panel_msg = await update.message.reply_text(
+                host_panel_text(game),
+                reply_markup=host_panel_keyboard(game),
+            )
+            game["host_panel_message_id"] = panel_msg.message_id
+            save_data(data)
         return
 
     wl, wr = build_winners_grid(game)
@@ -2913,6 +3060,15 @@ async def pnlgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_photo(chat_id=int(chat_id), photo=winners_buf)
     img_buf = generate_pnl_grid_image(game_labels, player_rows)
     await context.bot.send_photo(chat_id=int(chat_id), photo=img_buf)
+
+    # Post inactive panel if none exists and no active game
+    if not game.get("host_panel_message_id") and not game.get("active"):
+        panel_msg = await update.message.reply_text(
+            host_panel_text(game),
+            reply_markup=host_panel_keyboard(game),
+        )
+        game["host_panel_message_id"] = panel_msg.message_id
+        save_data(data)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
