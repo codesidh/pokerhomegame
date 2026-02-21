@@ -461,8 +461,9 @@ def build_pnl_grid(game: dict):
             label = f"G{i}"
         game_labels.append(label)
 
-    # Collect per-player per-game P&L
-    all_players = {}  # canonical_name -> [pnl_or_None per game]
+    # Collect per-player per-game P&L and rebuys
+    all_players = {}   # canonical_name -> [pnl_or_None per game]
+    all_rebuys = {}    # canonical_name -> [rebuys_or_None per game]
     for gi, g in enumerate(games_to_process):
         players_data = g.get("players", {})
         winners_data = g.get("winners", {})
@@ -470,6 +471,7 @@ def build_pnl_grid(game: dict):
             canonical = name_map.get(pname, pname)
             if canonical not in all_players:
                 all_players[canonical] = [None] * len(games_to_process)
+                all_rebuys[canonical] = [None] * len(games_to_process)
             total_in = pdata.get("in", 0)
             payout = 0.0
             for w in winners_data.values():
@@ -478,12 +480,14 @@ def build_pnl_grid(game: dict):
                     payout = w["payout"]
                     break
             all_players[canonical][gi] = payout - total_in
+            all_rebuys[canonical][gi] = pdata.get("rebuys", 0)
 
     # Build rows sorted by total desc
     player_rows = []
     for name, pnls in all_players.items():
         total = sum(v for v in pnls if v is not None)
-        player_rows.append((name, pnls, total))
+        rebuys = all_rebuys[name]
+        player_rows.append((name, pnls, total, rebuys))
     player_rows.sort(key=lambda x: -x[2])
 
     return game_labels, player_rows
@@ -505,20 +509,25 @@ def generate_pnl_grid_image(game_labels, player_rows):
     accent_green = (40, 180, 70)
     accent_red = (200, 50, 50)
 
+    text_rebuy = (180, 160, 80)  # muted yellow for rebuy indicator
+
     # Use default font (monospace-like)
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
         font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
         font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10)
     except (OSError, IOError):
         try:
             font = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 14)
             font_bold = font
             font_header = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 13)
+            font_small = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 10)
         except (OSError, IOError):
             font = ImageFont.load_default()
             font_bold = font
             font_header = font
+            font_small = font
 
     # Calculate dimensions
     padding = 10
@@ -530,14 +539,29 @@ def generate_pnl_grid_image(game_labels, player_rows):
     # Measure name column width to fit longest name
     tmp_img = Image.new("RGB", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_img)
-    for name, _, _ in player_rows:
+    for name, _, _, _ in player_rows:
         bbox = tmp_draw.textbbox((0, 0), name, font=font_bold)
         name_col_w = max(name_col_w, bbox[2] - bbox[0] + 20)
 
-    # Measure game column widths
+    # Measure game column widths (account for rebuy labels like "+$400 (R3)")
     for label in game_labels:
         bbox = tmp_draw.textbbox((0, 0), label, font=font_header)
         game_col_w = max(game_col_w, bbox[2] - bbox[0] + 20)
+    for _, pnls, _, rebuys in player_rows:
+        for pnl, rb in zip(pnls, rebuys):
+            if pnl is None:
+                continue
+            rb_count = rb if rb is not None else 0
+            if pnl > 0.01:
+                sample = f"+${pnl:.0f}"
+            elif pnl < -0.01:
+                sample = f"-${abs(pnl):.0f}"
+            else:
+                sample = "$0"
+            if rb_count > 0:
+                sample += f" (R{rb_count})"
+            bbox = tmp_draw.textbbox((0, 0), sample, font=font)
+            game_col_w = max(game_col_w, bbox[2] - bbox[0] + 16)
 
     num_games = len(game_labels)
     img_w = padding + name_col_w + num_games * game_col_w + total_col_w + padding
@@ -568,7 +592,7 @@ def generate_pnl_grid_image(game_labels, player_rows):
     draw.line([0, y + cell_h, img_w, y + cell_h], fill=border_color, width=2)
 
     # Draw player rows
-    for ri, (name, pnls, total) in enumerate(player_rows):
+    for ri, (name, pnls, total, rebuys) in enumerate(player_rows):
         y = padding + cell_h + ri * cell_h
         row_bg = row_even if ri % 2 == 0 else row_odd
         draw.rectangle([0, y, img_w, y + cell_h], fill=row_bg)
@@ -577,22 +601,30 @@ def generate_pnl_grid_image(game_labels, player_rows):
         draw.text((x + 4, y + 6), name, font=font_bold, fill=text_white)
         x += name_col_w
 
-        for pnl in pnls:
+        for gi, pnl in enumerate(pnls):
+            rb = rebuys[gi] if rebuys[gi] is not None else 0
             if pnl is None:
                 txt = "---"
                 color = text_gray
             elif pnl > 0.01:
                 txt = f"+${pnl:.0f}"
+                if rb > 0:
+                    txt += f" (R{rb})"
                 color = text_green
             elif pnl < -0.01:
                 txt = f"-${abs(pnl):.0f}"
+                if rb > 0:
+                    txt += f" (R{rb})"
                 color = text_red
             else:
                 txt = "$0"
+                if rb > 0:
+                    txt += f" (R{rb})"
                 color = text_gray
             bbox = draw.textbbox((0, 0), txt, font=font)
             tw = bbox[2] - bbox[0]
-            draw.text((x + (game_col_w - tw) // 2, y + 6), txt, font=font, fill=color)
+            tx = x + (game_col_w - tw) // 2
+            draw.text((tx, y + 6), txt, font=font, fill=color)
             x += game_col_w
 
         # Total column with accent background
@@ -1534,8 +1566,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             img_buf = generate_pnl_grid_image(game_labels, player_rows)
             await context.bot.send_photo(chat_id=int(chat_id), photo=img_buf)
-            text_msg = format_pnl_grid_text(game_labels, player_rows)
-            await context.bot.send_message(chat_id=int(chat_id), text=text_msg, parse_mode="HTML")
             return
 
         if cb_data == "host_endgame":
@@ -2633,8 +2663,6 @@ async def pnlgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     img_buf = generate_pnl_grid_image(game_labels, player_rows)
     await context.bot.send_photo(chat_id=int(chat_id), photo=img_buf)
-    text_msg = format_pnl_grid_text(game_labels, player_rows)
-    await context.bot.send_message(chat_id=int(chat_id), text=text_msg, parse_mode="HTML")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
