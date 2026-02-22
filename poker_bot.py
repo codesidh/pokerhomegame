@@ -1401,15 +1401,27 @@ async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args:
         target_name = " ".join(context.args).replace("@", "").lower()
+        matches = []
         for pid, p in list(game["players"].items()):
-            if p["name"].lower() == target_name:
-                removed = game["players"].pop(pid)
-                save_data(data)
-                await update.message.reply_text(f"{removed['name']} has been removed.")
-                await update_host_panel(game, chat_id, context)
-                return
+            if display_name(p).lower() == target_name or p["name"].lower() == target_name:
+                matches.append((pid, p))
 
-    await update.message.reply_text("Player not found. Try: /kick PlayerName")
+        if len(matches) == 1:
+            pid, p = matches[0]
+            removed = game["players"].pop(pid)
+            save_data(data)
+            await update.message.reply_text(f"{display_name(removed)} has been removed.")
+            await update_host_panel(game, chat_id, context)
+            return
+        elif len(matches) > 1:
+            names = ", ".join(f"{display_name(p)} (uid:{pid[-4:]})" for pid, p in matches)
+            await update.message.reply_text(
+                f"Multiple players match '{target_name}': {names}\n"
+                f"Use the player's nickname instead to be specific."
+            )
+            return
+
+    await update.message.reply_text("Player not found. Try: /kick PlayerNickname")
 
 
 async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1458,22 +1470,44 @@ async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Find player by name or current nickname, save by user_id
     found = False
     if game.get("active"):
+        matches = []
         for pid, p in game["players"].items():
             if p["name"].lower() == search_name.lower() or display_name(p).lower() == search_name.lower():
-                old_display = display_name(p)
-                p["nickname"] = nickname
-                game["nicknames"][pid] = nickname
-                save_data(data)
-                await update.message.reply_text(f"Nickname set: {old_display} \u27a1 {nickname}")
-                await update_host_panel(game, chat_id, context)
-                found = True
-                break
+                matches.append((pid, p))
+
+        if len(matches) == 1:
+            pid, p = matches[0]
+            old_display = display_name(p)
+            p["nickname"] = nickname
+            game["nicknames"][pid] = nickname
+            save_data(data)
+            await update.message.reply_text(f"Nickname set: {old_display} \u27a1 {nickname}")
+            await update_host_panel(game, chat_id, context)
+            found = True
+        elif len(matches) > 1:
+            names = ", ".join(f"{display_name(p)} ({p['name']})" for _, p in matches)
+            await update.message.reply_text(
+                f"Multiple players match '{search_name}': {names}\n"
+                f"Use the player's current nickname to be specific."
+            )
+            found = True  # Prevent fallback
 
     if not found:
-        # No active game or player not found — save by search name as fallback
-        game["nicknames"][search_name] = nickname
-        save_data(data)
-        await update.message.reply_text(f"Nickname saved: {search_name} \u27a1 {nickname}")
+        # No active game or player not found — try to match uid in nicknames first
+        matched_uid = None
+        for nuid, nnick in game.get("nicknames", {}).items():
+            if nnick.lower() == search_name.lower():
+                matched_uid = nuid
+                break
+        if matched_uid:
+            game["nicknames"][matched_uid] = nickname
+            save_data(data)
+            await update.message.reply_text(f"Nickname updated: {search_name} \u27a1 {nickname}")
+        else:
+            await update.message.reply_text(
+                f"Player '{search_name}' not found.\n"
+                f"Use their current nickname or Telegram name."
+            )
 
 
 async def lockrebuy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1593,7 +1627,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{game['host_name']}, approve or reject:",
             reply_markup=approval_keyboard(request_id),
         )
-        await update_host_panel(game, chat_id, context)
         return
 
     # ── Lobby: Rebuy Button ───────────────────────────────────────────────
@@ -1613,6 +1646,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = game["buy_in_amount"]
         player_name = display_name(game["players"][uid])
         request_id = uuid.uuid4().hex[:8]
+        logger.info(f"REBUY REQUEST: player={player_name} uid={uid} amount={amount} req={request_id} chat={chat_id}")
         game["pending"].append({
             "type": "rebuy", "user_id": uid, "name": player_name,
             "amount": amount, "status": "pending",
@@ -1629,7 +1663,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{game['host_name']}, approve or reject:",
             reply_markup=approval_keyboard(request_id),
         )
-        await update_host_panel(game, chat_id, context)
         return
 
     # ── New Game Buy-in Selection ─────────────────────────────────────
@@ -1765,6 +1798,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "rebuys": len(p["buy_ins"]) - 1,
                 }
                 for p in game["players"].values()
+            },
+            "player_uids": {
+                pid: display_name(p)
+                for pid, p in game["players"].items()
             },
             "winners": {
                 place: {"name": w["name"], "payout": w["payout"], "pct": int(w["percentage"] * 100)}
@@ -2123,6 +2160,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     }
                     for p in game["players"].values()
                 },
+                "player_uids": {
+                    pid: display_name(p)
+                    for pid, p in game["players"].items()
+                },
                 "winners": {
                     place: {"name": w["name"], "payout": w["payout"], "pct": int(w["percentage"] * 100)}
                     for place, w in game["winners"].items()
@@ -2201,6 +2242,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         amount = game["buy_in_amount"]
+        request_id = uuid.uuid4().hex[:8]
+        logger.info(f"HOST ADD PLAYER: player={nick} target_uid={target_uid} amount={amount} host_uid={uid} req={request_id} chat={chat_id}")
         game["players"][target_uid] = {
             "name": nick, "buy_ins": [amount], "eliminated": False, "nickname": nick,
         }
@@ -2208,7 +2251,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "type": "join", "user_id": target_uid, "name": nick,
             "amount": amount, "status": "approved",
             "timestamp": datetime.now().isoformat(),
-            "request_id": uuid.uuid4().hex[:8],
+            "request_id": request_id,
         })
         save_data(data)
 
@@ -2223,7 +2266,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_host_panel(game, chat_id, context)
         return
 
-    # ── Host Add Rebuy on Behalf ──────────────────────────────────────────
+    # ── Host Add Rebuy on Behalf - Confirmation ────────────────────────────
     if cb_data.startswith("hadr_"):
         if not is_host(game, uid):
             await query.answer("Only the host can do this.", show_alert=True)
@@ -2231,6 +2274,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
         target_uid = cb_data[5:]
+        if target_uid not in game["players"]:
+            await query.edit_message_text("Player not found in the game.")
+            return
+        if not game.get("active"):
+            await query.edit_message_text("No active game.")
+            return
+
+        player = game["players"][target_uid]
+        player_name = display_name(player)
+        amount = game["buy_in_amount"]
+        current_in = sum(player["buy_ins"])
+        rebuys = len(player["buy_ins"]) - 1
+
+        await query.edit_message_text(
+            f"Confirm rebuy for {player_name}?\n"
+            f"Amount: ${amount:.2f}\n"
+            f"Currently in: ${current_in:.2f} ({rebuys} rebuy{'s' if rebuys != 1 else ''})",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Confirm {player_name} Rebuy", callback_data=f"hadrc_{target_uid}")],
+                [InlineKeyboardButton("Cancel", callback_data="hadr_cancel")],
+            ]),
+        )
+        return
+
+    # ── Host Add Rebuy - Confirmed ───────────────────────────────────────────
+    if cb_data.startswith("hadrc_"):
+        if not is_host(game, uid):
+            await query.answer("Only the host can do this.", show_alert=True)
+            return
+        await query.answer()
+
+        target_uid = cb_data[6:]
         if target_uid not in game["players"]:
             await query.edit_message_text("Player not found in the game.")
             return
@@ -2248,11 +2323,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rebuys = len(player["buy_ins"]) - 1
         pot = get_total_pot(game)
 
+        request_id = uuid.uuid4().hex[:8]
+        logger.info(f"HOST ADD REBUY: player={player_name} target_uid={target_uid} amount={amount} host_uid={uid} req={request_id} chat={chat_id}")
         game["pending"].append({
             "type": "rebuy", "user_id": target_uid, "name": player_name,
             "amount": amount, "status": "approved",
             "timestamp": datetime.now().isoformat(),
-            "request_id": uuid.uuid4().hex[:8],
+            "request_id": request_id,
         })
         save_data(data)
 
@@ -2262,6 +2339,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Total Prize Pool: ${pot:.2f}"
         )
         await update_host_panel(game, chat_id, context)
+        return
+
+    # ── Host Add Rebuy - Cancelled ───────────────────────────────────────────
+    if cb_data == "hadr_cancel":
+        await query.answer()
+        await query.edit_message_text("Rebuy cancelled.")
         return
 
     # ── Host-only actions below this point ────────────────────────────────
@@ -2414,8 +2497,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Request not found.", show_alert=True)
         return
 
+    await query.answer()
+
     if req["status"] != "pending":
-        await query.edit_message_text(f"This request was already {req['status']}.")
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         return
 
     player_uid = req["user_id"]
@@ -2425,9 +2513,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "reject":
         req["status"] = "rejected"
         save_data(data)
-        await query.edit_message_text(
-            f"REJECTED: {player_name}'s {req['type']} request (${amount:.2f})"
-        )
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         return
 
     # APPROVE
@@ -2444,16 +2533,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pot = get_total_pot(game)
         save_data(data)
 
-        await query.edit_message_text(
-            f"\u2705 APPROVED - {player_name} joins!\n"
-            f"Buy-in: ${amount:.2f}\n"
-            f"Total Prize Pool: ${pot:.2f} | Players: {total_players}\n"
-            f"Payout: {format_payout_structure(total_players)}"
-        )
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
         await update_host_panel(game, chat_id, context)
 
     elif req["type"] == "rebuy":
         if player_uid in game["players"]:
+            logger.info(f"REBUY APPROVED: player={player_name} uid={player_uid} amount={amount} req={request_id} host_uid={uid} chat={chat_id}")
             game["players"][player_uid]["buy_ins"].append(amount)
             game["players"][player_uid]["eliminated"] = False
             total_in = sum(game["players"][player_uid]["buy_ins"])
@@ -2461,14 +2549,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pot = get_total_pot(game)
             save_data(data)
 
-            await query.edit_message_text(
-                f"\u2705 APPROVED - {player_name} rebuys ${amount:.2f}\n"
-                f"Total in: ${total_in:.2f} ({rebuys} rebuy{'s' if rebuys > 1 else ''})\n"
-                f"Total Prize Pool: ${pot:.2f}"
-            )
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
             await update_host_panel(game, chat_id, context)
         else:
-            await query.edit_message_text(f"{player_name} is not in the tournament.")
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
 
     save_data(data)
 
@@ -2964,6 +3054,10 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             for p in game["players"].values()
         },
+        "player_uids": {
+            pid: display_name(p)
+            for pid, p in game["players"].items()
+        },
         "winners": {
             place: {"name": w["name"], "payout": w["payout"], "pct": int(w["percentage"] * 100)}
             for place, w in game["winners"].items()
@@ -3146,6 +3240,12 @@ async def reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["rebuy_locked"] = False
 
     game["players"] = {}
+    # Build reverse mapping: display_name -> uid (from player_uids if available)
+    name_to_uid = {}
+    if last.get("player_uids"):
+        name_to_uid = {dname: uid for uid, dname in last["player_uids"].items()}
+
+    nicknames = game.get("nicknames", {})
     for pname, pdata in last.get("players", {}).items():
         total_in = pdata.get("in", 0)
         rebuys = pdata.get("rebuys", 0)
@@ -3153,7 +3253,10 @@ async def reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buy_ins = [buy_in] + [buy_in] * rebuys if buy_in > 0 else [total_in]
         if abs(sum(buy_ins) - total_in) > 0.01:
             buy_ins = [total_in]
-        game["players"][pname] = {"name": pname, "buy_ins": buy_ins, "eliminated": False}
+        # Use uid as key if available, otherwise fall back to name
+        player_uid = name_to_uid.get(pname, pname)
+        nick = nicknames.get(player_uid, pname)
+        game["players"][player_uid] = {"name": pname, "buy_ins": buy_ins, "eliminated": False, "nickname": nick}
 
     game["history"].pop()
     save_data(data)
@@ -3389,7 +3492,7 @@ async def pnlgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(False).build()
 
     # Host commands
     app.add_handler(CommandHandler("start", start))
