@@ -1204,26 +1204,43 @@ def host_panel_text(game: dict) -> str:
 async def update_host_panel(game: dict, chat_id: str, context: ContextTypes.DEFAULT_TYPE):
     if not game.get("host_panel_message_id"):
         return
-    # Delete old panel and re-post at bottom so it's always current
-    try:
-        await context.bot.delete_message(
-            chat_id=int(chat_id),
-            message_id=game["host_panel_message_id"],
-        )
-    except Exception:
-        pass
-    try:
-        new_msg = await context.bot.send_message(
-            chat_id=int(chat_id),
-            text=host_panel_text(game),
-            reply_markup=host_panel_keyboard(game),
-        )
-        game["host_panel_message_id"] = new_msg.message_id
-        data = load_data()
-        data[chat_id]["host_panel_message_id"] = new_msg.message_id
-        save_data(data)
-    except Exception:
-        pass
+
+    # Only bring panel to bottom when:
+    # - No active game (inactive panel — easy access to New Game)
+    # - Active game with rebuys open (players need Join/Rebuy buttons)
+    # Otherwise edit in place so workflow messages aren't buried.
+    bring_to_bottom = not game.get("active") or not game.get("rebuy_locked", False)
+
+    if bring_to_bottom:
+        try:
+            await context.bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=game["host_panel_message_id"],
+            )
+        except Exception:
+            pass
+        try:
+            new_msg = await context.bot.send_message(
+                chat_id=int(chat_id),
+                text=host_panel_text(game),
+                reply_markup=host_panel_keyboard(game),
+            )
+            game["host_panel_message_id"] = new_msg.message_id
+            data = load_data()
+            data[chat_id]["host_panel_message_id"] = new_msg.message_id
+            save_data(data)
+        except Exception:
+            pass
+    else:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=game["host_panel_message_id"],
+                text=host_panel_text(game),
+                reply_markup=host_panel_keyboard(game),
+            )
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1700,6 +1717,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Final Hand Photo Prompt ───────────────────────────────────────
+    if cb_data == "endgame_photo_upload":
+        afp = game.get("awaiting_final_photo")
+        if not afp or afp.get("host_id") != uid:
+            await query.answer("Only the host can upload the photo.", show_alert=True)
+            return
+        await query.answer()
+        afp["ready"] = True
+        save_data(data)
+        await query.edit_message_text("\U0001f4f8 Send the final hand photo now.")
+        return
+
+    if cb_data == "endgame_photo_skip":
+        afp = game.get("awaiting_final_photo")
+        if not afp or afp.get("host_id") != uid:
+            await query.answer("Only the host can do this.", show_alert=True)
+            return
+        await query.answer()
+        game.pop("awaiting_final_photo", None)
+        save_data(data)
+        await query.edit_message_text("Skipped. No photo saved.")
+        await update_host_panel(game, chat_id, context)
+        return
+
     if cb_data == "endgame_confirm":
         if not is_host(game, uid):
             await query.answer("Only the host can do this.", show_alert=True)
@@ -1708,6 +1749,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pot = get_total_pot(game)
         game_name = game.get("game_name") or "Tournament"
+        original_host_uid = game["host_id"]
 
         summary = {
             "date": game["started_at"],
@@ -1748,6 +1790,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game["game_name"] = None
         game["rebuy_locked"] = False
         game["lobby_message_id"] = None
+
+        game["awaiting_final_photo"] = {"host_id": original_host_uid}
         save_data(data)
 
         await query.edit_message_text(
@@ -1757,6 +1801,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\U0001f465 Players: {summary['player_count']} | \U0001f4b0 Prize Pool: ${pot:.2f}\n\n"
             f"\u26a0\ufe0f Ended without winners.\n"
             f"Archived. Use /reopen to add winners later."
+        )
+
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text="\U0001f4f8 Upload the final hand picture?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f4f8 Upload Photo", callback_data="endgame_photo_upload")],
+                [InlineKeyboardButton("\u23ed Skip", callback_data="endgame_photo_skip")],
+            ]),
         )
 
         # Refresh host panel to inactive state
@@ -1827,10 +1880,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     for place, w in sorted(g["winners"].items()):
                         emoji = place_emojis_h.get(str(place), "  ")
                         hist_text += f"  {emoji} {w['name']} - ${w['payout']:.2f} ({w['pct']}%)\n"
+                if g.get("final_hand_photo"):
+                    hist_text += "  \U0001f4f8 Final hand photo attached\n"
                 hist_text += "\n"
             if total_pages > 1:
                 hist_text += f"Use /history <page> to navigate (1-{total_pages})"
             await query.message.reply_text(hist_text)
+            # Send final hand photos for games on this page
+            for i, g in enumerate(page_games, start_idx + 1):
+                if g.get("final_hand_photo"):
+                    gname = g.get("game_name") or f"Game #{i}"
+                    await context.bot.send_photo(
+                        chat_id=int(chat_id),
+                        photo=g["final_hand_photo"],
+                        caption=f"\U0001f4f8 Final hand - {gname}",
+                    )
             await update_host_panel(game, chat_id, context)
             return
 
@@ -2042,6 +2106,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pot = get_total_pot(game)
             game_name = game.get("game_name") or "Tournament"
             place_emojis_e = {"1": "\U0001f947", "2": "\U0001f948", "3": "\U0001f949"}
+            original_host_uid = game["host_id"]
 
             summary = {
                 "date": game["started_at"],
@@ -2082,6 +2147,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game["game_name"] = None
             game["rebuy_locked"] = False
             game["lobby_message_id"] = None
+
+            game["awaiting_final_photo"] = {"host_id": original_host_uid}
             save_data(data)
 
             winner_lines = ""
@@ -2096,6 +2163,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"\U0001f465 Players: {summary['player_count']} | \U0001f4b0 Prize Pool: ${pot:.2f}\n\n"
                 f"\U0001f3c6 Winners:\n{winner_lines}\n"
                 f"Archived. Use /history to review."
+            )
+
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text="\U0001f4f8 Upload the final hand picture?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f4f8 Upload Photo", callback_data="endgame_photo_upload")],
+                    [InlineKeyboardButton("\u23ed Skip", callback_data="endgame_photo_skip")],
+                ]),
             )
 
             # Refresh host panel to inactive state
@@ -2871,6 +2947,7 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pot = get_total_pot(game)
     game_name = game.get("game_name") or "Tournament"
     place_emojis = {"1": "\U0001f947", "2": "\U0001f948", "3": "\U0001f949"}
+    original_host_uid = game["host_id"]
 
     summary = {
         "date": game["started_at"],
@@ -2912,6 +2989,8 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game["game_name"] = None
     game["rebuy_locked"] = False
     game["lobby_message_id"] = None
+
+    game["awaiting_final_photo"] = {"host_id": original_host_uid}
     save_data(data)
 
     winner_lines = ""
@@ -2926,6 +3005,14 @@ async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\U0001f465 Players: {summary['player_count']} | \U0001f4b0 Prize Pool: ${pot:.2f}\n\n"
         f"\U0001f3c6 Winners:\n{winner_lines}\n"
         f"Archived. Use /history to review."
+    )
+
+    await update.message.reply_text(
+        "\U0001f4f8 Upload the final hand picture?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f4f8 Upload Photo", callback_data="endgame_photo_upload")],
+            [InlineKeyboardButton("\u23ed Skip", callback_data="endgame_photo_skip")],
+        ]),
     )
 
     # Refresh host panel to inactive state
@@ -2978,12 +3065,24 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for place, w in sorted(g["winners"].items()):
                 emoji = place_emojis.get(str(place), "  ")
                 text += f"  {emoji} {w['name']} - ${w['payout']:.2f} ({w['pct']}%)\n"
+        if g.get("final_hand_photo"):
+            text += "  \U0001f4f8 Final hand photo attached\n"
         text += "\n"
 
     if total_pages > 1:
         text += f"Use /history <page> to navigate (1-{total_pages})"
 
     await update.message.reply_text(text)
+
+    # Send final hand photos for games on this page
+    for i, g in enumerate(page_games, start_idx + 1):
+        if g.get("final_hand_photo"):
+            gname = g.get("game_name") or f"Game #{i}"
+            await context.bot.send_photo(
+                chat_id=int(chat_id),
+                photo=g["final_hand_photo"],
+                caption=f"\U0001f4f8 Final hand - {gname}",
+            )
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3085,6 +3184,33 @@ async def reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         game["host_panel_message_id"] = host_msg.message_id
     save_data(data)
+
+
+# ── Final Hand Photo Handler ──────────────────────────────────────────────────
+async def handle_final_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Captures photo upload for final hand when awaiting_final_photo is set."""
+    chat_id = str(update.effective_chat.id)
+    uid = str(update.effective_user.id)
+
+    data = load_data()
+    game = get_game(chat_id, data)
+
+    logger.info(f"Photo received in chat {chat_id} from user {uid}")
+    afp = game.get("awaiting_final_photo")
+    if not afp or not afp.get("ready"):
+        logger.info(f"Not awaiting photo: afp={afp}")
+        return  # Not awaiting a photo
+
+    file_id = update.message.photo[-1].file_id  # Largest size
+    logger.info(f"Saving final hand photo: {file_id[:20]}...")
+    if game["history"]:
+        game["history"][-1]["final_hand_photo"] = file_id
+    game.pop("awaiting_final_photo", None)
+    save_data(data)
+
+    game_name = game["history"][-1].get("game_name", "Tournament") if game["history"] else "Tournament"
+    await update.message.reply_text(f"\U0001f4f8 Final hand photo saved for {game_name}!")
+    await update_host_panel(game, chat_id, context)
 
 
 # ── Custom Payout Handler ────────────────────────────────────────────────────
@@ -3290,6 +3416,9 @@ def main():
 
     # Custom payout text input (must be before general callback handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_payout))
+
+    # Final hand photo capture
+    app.add_handler(MessageHandler(filters.PHOTO, handle_final_photo))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
