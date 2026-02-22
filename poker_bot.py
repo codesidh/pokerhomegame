@@ -910,6 +910,363 @@ def generate_pnl_grid_image(game_labels, player_rows):
     return buf
 
 
+def generate_settlement_image(
+    title_line: str,
+    game_count: int,
+    total_prize_pool: float,
+    player_count: int,
+    combined_pnl: list,
+    payments: list,
+) -> io.BytesIO:
+    """Render a premium dark-themed settlement scoreboard as a PNG image.
+
+    Args:
+        title_line: e.g. "Feb 19th 2026 → Feb 21st 2026"
+        game_count: number of games included
+        total_prize_pool: sum of all pots
+        player_count: unique players
+        combined_pnl: [(name, net), ...] sorted by profit desc
+        payments: [(debtor, creditor, amount), ...]
+
+    Returns a BytesIO buffer containing the PNG.
+    """
+    # ── Theme ──
+    bg_color = (18, 18, 28)
+    bg_top = (22, 22, 35)
+    card_bg = (32, 32, 46)
+    card_bg_alt = (38, 38, 52)
+    card_shadow = (12, 12, 20)
+    card_highlight = (48, 48, 65)
+    accent_purple = (90, 80, 160)
+    arrow_purple = (140, 130, 200)
+    gold = (255, 215, 50)
+    green = (50, 200, 90)
+    green_bright = (90, 240, 120)
+    red = (210, 60, 60)
+    red_bright = (245, 95, 95)
+    text_white = (235, 235, 245)
+    text_muted = (130, 130, 155)
+    text_dim = (80, 80, 105)
+    shadow_color = (8, 8, 15)
+
+    # ── Fonts (bigger sizes) ──
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 26)
+        font_stat_val = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 24)
+        font_body = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 17)
+        font_body_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 17)
+        font_label = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
+        font_section = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 16)
+    except (OSError, IOError):
+        try:
+            font_title = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 26)
+            font_stat_val = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 24)
+            font_body = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 17)
+            font_body_bold = font_body
+            font_label = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 13)
+            font_section = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 16)
+        except (OSError, IOError):
+            font_title = ImageFont.load_default()
+            font_stat_val = font_title
+            font_body = font_title
+            font_body_bold = font_title
+            font_label = font_title
+            font_section = font_title
+
+    W = 780
+    pad = 32
+    inner = W - 2 * pad
+
+    # Temp draw surface for measuring
+    tmp = Image.new("RGB", (1, 1))
+    td = ImageDraw.Draw(tmp)
+
+    def tw(text, font):
+        bbox = td.textbbox((0, 0), text, font=font)
+        return bbox[2] - bbox[0]
+
+    def th(text, font):
+        bbox = td.textbbox((0, 0), text, font=font)
+        return bbox[3] - bbox[1]
+
+    # ── 3D helper: draw text with drop shadow ──
+    def draw_text_3d(draw_ctx, pos, text, font, fill, shadow=shadow_color, offset=2):
+        draw_ctx.text((pos[0] + offset, pos[1] + offset), text, font=font, fill=shadow)
+        draw_ctx.text(pos, text, font=font, fill=fill)
+
+    # ── 3D helper: draw rounded rect with shadow + highlight ──
+    def draw_card_3d(draw_ctx, box, fill, radius=6, shadow_off=3):
+        x0, y0, x1, y1 = box
+        # Shadow layer
+        draw_ctx.rounded_rectangle(
+            [x0 + shadow_off, y0 + shadow_off, x1 + shadow_off, y1 + shadow_off],
+            radius=radius, fill=card_shadow,
+        )
+        # Main card
+        draw_ctx.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=fill)
+        # Top highlight edge
+        draw_ctx.line([x0 + radius, y0 + 1, x1 - radius, y0 + 1], fill=card_highlight, width=1)
+
+    # ── Compute dynamic height ──
+    y = 0
+    y += 28  # top padding
+    y += th("GRINDERS", font_title) + 6
+    y += th("COMBINED POKER SETTLEMENT", font_label) + 14
+    y += 4  # accent line
+    y += 22  # gap
+
+    stat_card_h = 62
+    y += stat_card_h + 22
+
+    y += th("P&L LEADERBOARD", font_section) + 14
+    row_h = 38
+    y += len(combined_pnl) * row_h + 18
+
+    y += 36  # settle up divider
+
+    pay_row_h = 44
+    pay_gap = 8
+    if payments:
+        y += len(payments) * (pay_row_h + pay_gap) + 10
+    else:
+        y += 36
+
+    y += 36  # footer
+
+    H = y
+
+    # ── Create canvas with subtle gradient ──
+    img = Image.new("RGB", (W, H), bg_color)
+    draw = ImageDraw.Draw(img)
+    # Subtle top-to-bottom gradient overlay
+    for gy in range(min(120, H)):
+        alpha = 1.0 - gy / 120.0
+        r = int(bg_color[0] + (bg_top[0] - bg_color[0]) * alpha)
+        g = int(bg_color[1] + (bg_top[1] - bg_color[1]) * alpha)
+        b = int(bg_color[2] + (bg_top[2] - bg_color[2]) * alpha)
+        draw.line([0, gy, W, gy], fill=(r, g, b))
+
+    y = 0
+
+    # ═══════════════════ HEADER ═══════════════════
+    y += 28
+    title_text = "GRINDERS"
+    title_w = tw(title_text, font_title)
+    draw_text_3d(draw, ((W - title_w) // 2, y), title_text, font_title, gold)
+    y += th(title_text, font_title) + 6
+
+    sub_text = "COMBINED POKER SETTLEMENT"
+    sub_w = tw(sub_text, font_label)
+    draw.text(((W - sub_w) // 2, y), sub_text, font=font_label, fill=text_muted)
+    y += th(sub_text, font_label) + 4
+
+    date_w = tw(title_line, font_label)
+    draw.text(((W - date_w) // 2, y), title_line, font=font_label, fill=text_muted)
+    y += th(title_line, font_label) + 10
+
+    # Purple accent line with glow
+    line_w = 220
+    draw.line([(W - line_w) // 2, y + 1, (W + line_w) // 2, y + 1], fill=(50, 45, 90), width=5)
+    draw.line([(W - line_w) // 2, y, (W + line_w) // 2, y], fill=accent_purple, width=3)
+    y += 4 + 22
+
+    # ═══════════════════ STATS STRIP ═══════════════════
+    card_w = (inner - 24) // 3
+    gap = 12
+    cards = [
+        (f"{game_count}", f"GAME{'S' if game_count != 1 else ''}"),
+        (f"${total_prize_pool:,.0f}", "TOTAL POT"),
+        (f"{player_count}", f"PLAYER{'S' if player_count != 1 else ''}"),
+    ]
+    cx = pad
+    for val_text, lbl_text in cards:
+        draw_card_3d(draw, [cx, y, cx + card_w, y + stat_card_h], card_bg, radius=10)
+        vw = tw(val_text, font_stat_val)
+        draw_text_3d(draw, (cx + (card_w - vw) // 2, y + 10), val_text, font_stat_val, gold)
+        lw = tw(lbl_text, font_label)
+        draw.text((cx + (card_w - lw) // 2, y + 40), lbl_text, font=font_label, fill=text_muted)
+        cx += card_w + gap
+    y += stat_card_h + 22
+
+    # ═══════════════════ P&L LEADERBOARD ═══════════════════
+    section_text = "P&L LEADERBOARD"
+    draw_text_3d(draw, (pad, y), section_text, font_section, text_muted, shadow=shadow_color, offset=1)
+    y += th(section_text, font_section) + 14
+
+    max_abs = max((abs(net) for _, net in combined_pnl), default=1)
+    if max_abs == 0:
+        max_abs = 1
+
+    bar_max_w = 200
+    rank_w = 42
+    name_col_w = 160
+    amount_col_w = 100
+    bar_area_x = pad + rank_w + name_col_w
+    bar_area_w = inner - rank_w - name_col_w - amount_col_w
+
+    medal_colors = {
+        0: ((255, 215, 50), (180, 150, 30)),
+        1: ((190, 200, 220), (130, 140, 160)),
+        2: ((220, 160, 80), (160, 110, 50)),
+    }
+
+    for idx, (name, net) in enumerate(combined_pnl):
+        ry = y + idx * row_h
+        row_bg = card_bg if idx % 2 == 0 else card_bg_alt
+        draw_card_3d(draw, [pad - 4, ry, W - pad + 4, ry + row_h - 2], row_bg, radius=5, shadow_off=2)
+
+        # Medal or rank number
+        if idx in medal_colors:
+            fill_c, border_c = medal_colors[idx]
+            cx_m = pad + 18
+            cy_m = ry + row_h // 2 - 1
+            r = 11
+            # 3D medal: shadow, then circle
+            draw.ellipse([cx_m - r + 2, cy_m - r + 2, cx_m + r + 2, cy_m + r + 2], fill=shadow_color)
+            draw.ellipse([cx_m - r, cy_m - r, cx_m + r, cy_m + r], fill=fill_c, outline=border_c, width=2)
+            # Highlight arc on top
+            draw.arc([cx_m - r + 2, cy_m - r + 1, cx_m + r - 2, cy_m], fill=(255, 255, 255, 80), start=200, end=340)
+            rank_num = str(idx + 1)
+            rnw = tw(rank_num, font_body_bold)
+            rnh = th(rank_num, font_body_bold)
+            draw.text((cx_m - rnw // 2, cy_m - rnh // 2 - 1), rank_num, font=font_body_bold, fill=(20, 20, 30))
+        else:
+            rank_text = f"{idx + 1}."
+            draw.text((pad + 10, ry + 9), rank_text, font=font_body, fill=text_muted)
+
+        # Name
+        name_color = green if net > 0.01 else (red if net < -0.01 else text_muted)
+        draw.text((pad + rank_w, ry + 9), name[:12], font=font_body_bold, fill=name_color)
+
+        # Bar with 3D bevel
+        bar_w = int((abs(net) / max_abs) * min(bar_area_w - 10, bar_max_w))
+        bar_w = max(bar_w, 0)
+        if abs(net) > 0.01 and bar_w > 0:
+            bar_color = green if net > 0 else red
+            tip_color = green_bright if net > 0 else red_bright
+            dark_bar = tuple(max(0, c - 40) for c in bar_color)
+            bx = bar_area_x
+            by_top = ry + 11
+            by_bot = ry + row_h - 13
+            # Shadow
+            draw.rounded_rectangle([bx + 2, by_top + 2, bx + bar_w + 2, by_bot + 2], radius=4, fill=shadow_color)
+            # Bar body
+            draw.rounded_rectangle([bx, by_top, bx + bar_w, by_bot], radius=4, fill=bar_color)
+            # Top highlight
+            draw.line([bx + 4, by_top + 1, bx + bar_w - 4, by_top + 1], fill=tip_color, width=1)
+            # Bottom shadow
+            draw.line([bx + 4, by_bot - 1, bx + bar_w - 4, by_bot - 1], fill=dark_bar, width=1)
+
+        # Amount pill
+        if net > 0.01:
+            amt_text = f"+${net:,.0f}"
+            amt_color = green_bright
+            pill_bg = (25, 65, 30)
+        elif net < -0.01:
+            amt_text = f"-${abs(net):,.0f}"
+            amt_color = red_bright
+            pill_bg = (65, 25, 25)
+        else:
+            amt_text = "$0"
+            amt_color = text_muted
+            pill_bg = None
+
+        aw = tw(amt_text, font_body_bold)
+        ax = W - pad - aw - 8
+        if pill_bg:
+            draw.rounded_rectangle(
+                [ax - 8, ry + 6, ax + aw + 8, ry + row_h - 8],
+                radius=5, fill=pill_bg,
+            )
+        draw.text((ax, ry + 9), amt_text, font=font_body_bold, fill=amt_color)
+
+    y += len(combined_pnl) * row_h + 18
+
+    # ═══════════════════ SETTLE UP DIVIDER ═══════════════════
+    div_text = " SETTLE UP "
+    div_tw = tw(div_text, font_section)
+    div_cx = W // 2
+    line_y = y + 15
+    # Glow line
+    draw.line([pad + 20, line_y + 1, div_cx - div_tw // 2 - 10, line_y + 1], fill=(50, 45, 90), width=3)
+    draw.line([pad + 20, line_y, div_cx - div_tw // 2 - 10, line_y], fill=accent_purple, width=1)
+    draw_text_3d(draw, (div_cx - div_tw // 2, y + 8), div_text, font_section, text_muted, offset=1)
+    draw.line([div_cx + div_tw // 2 + 10, line_y + 1, W - pad - 20, line_y + 1], fill=(50, 45, 90), width=3)
+    draw.line([div_cx + div_tw // 2 + 10, line_y, W - pad - 20, line_y], fill=accent_purple, width=1)
+    y += 36
+
+    # ═══════════════════ PAYMENTS ═══════════════════
+    if payments:
+        border_color_pay = (55, 55, 75)
+        for pi, (debtor, creditor, amount) in enumerate(payments):
+            py = y + pi * (pay_row_h + pay_gap)
+            card_left = pad + 4
+            card_right = W - pad - 4
+
+            # 3D card
+            draw_card_3d(draw, [card_left, py, card_right, py + pay_row_h], card_bg, radius=8, shadow_off=3)
+            # Border
+            draw.rounded_rectangle(
+                [card_left, py, card_right, py + pay_row_h],
+                radius=8, fill=None, outline=border_color_pay, width=1,
+            )
+
+            # Left accent stripe
+            draw.rounded_rectangle([card_left, py + 4, card_left + 5, py + pay_row_h - 4], radius=2, fill=red)
+
+            # Debtor → Creditor  $Amount  (all tight, no gap)
+            x_cur = card_left + 16
+            text_y = py + (pay_row_h - th("A", font_body_bold)) // 2
+
+            debtor_disp = debtor[:12]
+            draw.text((x_cur, text_y), debtor_disp, font=font_body_bold, fill=red_bright)
+            x_cur += tw(debtor_disp, font_body_bold)
+
+            arrow_text = " \u2192 "
+            draw.text((x_cur, text_y), arrow_text, font=font_body, fill=arrow_purple)
+            x_cur += tw(arrow_text, font_body)
+
+            creditor_disp = creditor[:12]
+            draw.text((x_cur, text_y), creditor_disp, font=font_body_bold, fill=green_bright)
+            x_cur += tw(creditor_disp, font_body_bold)
+
+            # Gold pill right next to creditor
+            amt = f"${amount:,.0f}"
+            amtw = tw(amt, font_body_bold)
+            amt_h = th(amt, font_body_bold)
+            pill_x = x_cur + 12
+            pill_y = py + (pay_row_h - amt_h - 10) // 2
+            # Pill shadow
+            draw.rounded_rectangle(
+                [pill_x + 2, pill_y + 2, pill_x + amtw + 18, pill_y + amt_h + 12],
+                radius=6, fill=shadow_color,
+            )
+            draw.rounded_rectangle(
+                [pill_x, pill_y, pill_x + amtw + 16, pill_y + amt_h + 10],
+                radius=6, fill=(55, 50, 18), outline=(140, 125, 45), width=1,
+            )
+            # Highlight on pill top
+            draw.line([pill_x + 6, pill_y + 1, pill_x + amtw + 10, pill_y + 1], fill=(80, 72, 30), width=1)
+            draw.text((pill_x + 8, pill_y + 5), amt, font=font_body_bold, fill=gold)
+
+        y += len(payments) * (pay_row_h + pay_gap) + 10
+    else:
+        even_text = "Everyone broke even!"
+        ew = tw(even_text, font_body)
+        draw.text(((W - ew) // 2, y + 6), even_text, font=font_body, fill=text_muted)
+        y += 36
+
+    # ═══════════════════ FOOTER ═══════════════════
+    footer = "Poker Night Bot"
+    fw = tw(footer, font_label)
+    draw.text(((W - fw) // 2, H - 26), footer, font=font_label, fill=text_dim)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
 def format_pnl_grid_text(game_labels, player_rows):
     """Format P&L grid as copyable monospace HTML text."""
     if not game_labels or not player_rows:
@@ -1107,7 +1464,10 @@ def host_panel_keyboard(game: dict) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("\U0001f3af P&L Grid", callback_data="host_pnlgrid"),
                 InlineKeyboardButton("\U0001f3c6 Leaderboard", callback_data="host_leaderboard"),
             ],
-            [InlineKeyboardButton("\U0001f4da History", callback_data="host_history")],
+            [
+                InlineKeyboardButton("\U0001f4da History", callback_data="host_history"),
+                InlineKeyboardButton("\U0001f4b8 Settle All", callback_data="host_settleall"),
+            ],
         ])
 
     # Active state: full controls + player buttons at bottom
@@ -1666,6 +2026,121 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── New Game Buy-in Selection ─────────────────────────────────────
+    if cb_data.startswith("settleall_"):
+        await query.answer()
+
+        history = game.get("history", [])
+
+        # Also build active game summary if winners are fully recorded
+        active_summary = None
+        if game.get("active") and game.get("winners"):
+            pc = len(game["players"])
+            ps = get_payout_structure(pc)
+            if len(game["winners"]) >= len(ps):
+                pot = get_total_pot(game)
+                active_summary = {
+                    "date": game.get("started_at"),
+                    "game_name": game.get("game_name") or "Current Game",
+                    "pot": pot,
+                    "buy_in": game["buy_in_amount"],
+                    "player_count": pc,
+                    "players": {
+                        display_name(p): {"in": sum(p["buy_ins"]), "rebuys": len(p["buy_ins"]) - 1}
+                        for p in game["players"].values()
+                    },
+                    "winners": {
+                        place: {
+                            "name": w["name"],
+                            "payout": w["payout"],
+                            "pct": int(w["percentage"] * 100),
+                        }
+                        for place, w in game["winners"].items()
+                    },
+                }
+
+        if cb_data == "settleall_today":
+            target_date = datetime.now().strftime("%Y-%m-%d")
+            selected_games = [h for h in history if h.get("date", "")[:10] == target_date]
+            if active_summary and active_summary.get("date", "")[:10] == target_date:
+                selected_games.append(active_summary)
+            title_line = format_date_ordinal(datetime.now())
+        elif cb_data.startswith("settleall_last_"):
+            n = int(cb_data[len("settleall_last_"):])
+            selected_games = list(history[-n:])
+            if active_summary and len(selected_games) < n:
+                selected_games.append(active_summary)
+            elif active_summary:
+                selected_games = selected_games[-(n - 1):] + [active_summary]
+            title_line = f"Last {n} games"
+        else:
+            selected_games = []
+            title_line = ""
+
+        if not selected_games:
+            await query.message.reply_text("No completed games found for that selection.")
+            return
+
+        # Build combined P&L
+        combined_pnl = {}
+        game_count = len(selected_games)
+        total_prize_pool = 0
+        for g in selected_games:
+            total_prize_pool += g.get("pot", 0)
+            players_data = g.get("players", {})
+            winners_data = g.get("winners", {})
+            for pname, pdata in players_data.items():
+                total_in = pdata.get("in", 0)
+                payout = 0.0
+                for w in winners_data.values():
+                    if w["name"] == pname:
+                        payout = w["payout"]
+                        break
+                net = payout - total_in
+                combined_pnl[pname] = combined_pnl.get(pname, 0) + net
+
+        sorted_combined = sorted(combined_pnl.items(), key=lambda x: -x[1])
+
+        # Greedy settlement
+        debtors = sorted(
+            [(k, -v) for k, v in combined_pnl.items() if v < -0.01],
+            key=lambda x: -x[1],
+        )
+        creditors = sorted(
+            [(k, v) for k, v in combined_pnl.items() if v > 0.01],
+            key=lambda x: -x[1],
+        )
+        payments = []
+        i, j = 0, 0
+        while i < len(debtors) and j < len(creditors):
+            d_name, debt = debtors[i]
+            c_name, credit = creditors[j]
+            amount = min(debt, credit)
+            if amount > 0.01:
+                payments.append((d_name, c_name, amount))
+            debtors[i] = (d_name, debt - amount)
+            creditors[j] = (c_name, credit - amount)
+            if debtors[i][1] < 0.01:
+                i += 1
+            if creditors[j][1] < 0.01:
+                j += 1
+
+        all_players = set()
+        for g in selected_games:
+            all_players.update(g.get("players", {}).keys())
+
+        buf = generate_settlement_image(
+            title_line=title_line,
+            game_count=game_count,
+            total_prize_pool=total_prize_pool,
+            player_count=len(all_players),
+            combined_pnl=sorted_combined,
+            payments=payments,
+        )
+        await context.bot.send_photo(chat_id=int(chat_id), photo=buf)
+        await query.edit_message_text("\U0001f4b8 Settlement image sent!")
+        await update_host_panel(game, chat_id, context)
+        return
+
     if cb_data.startswith("newgame_buyin_"):
         await query.answer()
 
@@ -1856,7 +2331,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Host Panel Buttons ──────────────────────────────────────────────
     if cb_data.startswith("host_"):
         # These buttons are available to everyone
-        public_buttons = {"host_newgame", "host_pnlgrid", "host_history", "host_leaderboard"}
+        public_buttons = {"host_newgame", "host_pnlgrid", "host_history", "host_leaderboard", "host_settleall"}
 
         # Host-only buttons during active game
         if cb_data not in public_buttons and not is_host(game, uid):
@@ -2076,6 +2551,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_photo(chat_id=int(chat_id), photo=winners_buf)
             img_buf = generate_pnl_grid_image(game_labels, player_rows)
             await context.bot.send_photo(chat_id=int(chat_id), photo=img_buf)
+            await update_host_panel(game, chat_id, context)
+            return
+
+        if cb_data == "host_settleall":
+            history = game.get("history", [])
+            if not history:
+                await query.message.reply_text("No completed games yet.")
+                return
+            total = len(history)
+            buttons = []
+            # Today's games
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_count = sum(1 for h in history if h.get("date", "")[:10] == today_str)
+            if today_count:
+                buttons.append([InlineKeyboardButton(
+                    f"\U0001f4c5 Today ({today_count} game{'s' if today_count != 1 else ''})",
+                    callback_data="settleall_today",
+                )])
+            # Preset counts
+            for n in [3, 5, 10]:
+                if total >= n:
+                    buttons.append([InlineKeyboardButton(
+                        f"\U0001f3b2 Last {n} games",
+                        callback_data=f"settleall_last_{n}",
+                    )])
+            # All games
+            buttons.append([InlineKeyboardButton(
+                f"\U0001f3b0 All {total} games",
+                callback_data=f"settleall_last_{total}",
+            )])
+            await query.message.reply_text(
+                "\U0001f4b8 SETTLE ALL\nSelect games to include:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
             await update_host_panel(game, chat_id, context)
             return
 
@@ -2882,42 +3391,13 @@ async def settleall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Build the dashboard
+    # Build combined P&L across selected games
     combined_pnl = {}
-    place_emojis = {"1": "\U0001f947", "2": "\U0001f948", "3": "\U0001f949"}
     game_count = len(selected_games)
-
-    text = (
-        f"\U0001f4ca COMBINED SETTLEMENT\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
-        f"{title_line}\n"
-        f"\U0001f3b0 {game_count} game{'s' if game_count != 1 else ''} played\n\n"
-    )
-
     total_prize_pool = 0
 
-    for gi, g in enumerate(selected_games, 1):
-        gname = g.get("game_name") or f"Game {gi}"
-        pot = g.get("pot", 0)
-        total_prize_pool += pot
-        game_date = g.get("date", "")[:10] if g.get("date") else ""
-
-        text += f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        text += f"\U0001f3af {gname}"
-        if game_date:
-            text += f"  ({game_date})"
-        text += "\n"
-        text += f"\U0001f4b0 ${pot:.2f} | \U0001f465 {g.get('player_count', '?')} players\n"
-
-        if g.get("winners"):
-            for place, w in sorted(g["winners"].items()):
-                emoji = place_emojis.get(str(place), "  ")
-                text += f"  {emoji} {w['name']} - ${w['payout']:.2f} ({w['pct']}%)\n"
-
-        # Per-game P&L
-        game_pnl = {}
+    for g in selected_games:
+        total_prize_pool += g.get("pot", 0)
         players_data = g.get("players", {})
         winners_data = g.get("winners", {})
 
@@ -2929,49 +3409,12 @@ async def settleall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     payout = w["payout"]
                     break
             net = payout - total_in
-            game_pnl[pname] = net
             combined_pnl[pname] = combined_pnl.get(pname, 0) + net
 
-        sorted_pnl = sorted(game_pnl.items(), key=lambda x: -x[1])
-        for pname, net in sorted_pnl:
-            if net > 0.01:
-                icon = "\U0001f7e2"
-                sign = "+"
-            elif net < -0.01:
-                icon = "\U0001f534"
-                sign = ""
-            else:
-                icon = "\u26aa"
-                sign = " "
-            text += f"  {icon} {pname:<14} {sign}${net:.2f}\n"
-
-        text += "\n"
-
-    # Combined summary
-    text += (
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f3c6 COMBINED RESULTS\n"
-        f"\U0001f4b0 Total Prize Pool: ${total_prize_pool:.2f}\n\n"
-    )
-
-    # Combined P&L
-    text += "\U0001f4c8 OVERALL P&L\n"
+    # Sort by profit descending
     sorted_combined = sorted(combined_pnl.items(), key=lambda x: -x[1])
-    for rank, (pname, net) in enumerate(sorted_combined, 1):
-        if net > 0.01:
-            icon = "\U0001f7e2"
-            sign = "+"
-        elif net < -0.01:
-            icon = "\U0001f534"
-            sign = ""
-        else:
-            icon = "\u26aa"
-            sign = " "
-        text += f"  {icon} {pname:<14} {sign}${net:.2f}\n"
 
-    # Combined minimal payments
+    # Build minimal payments via greedy algorithm
     debtors = sorted(
         [(k, -v) for k, v in combined_pnl.items() if v < -0.01],
         key=lambda x: -x[1],
@@ -2981,25 +3424,40 @@ async def settleall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key=lambda x: -x[1],
     )
 
-    if debtors and creditors:
-        text += "\n\U0001f4b8 COMBINED PAYMENTS (settle once!)\n"
-        i, j = 0, 0
-        while i < len(debtors) and j < len(creditors):
-            d_name, debt = debtors[i]
-            c_name, credit = creditors[j]
-            amount = min(debt, credit)
-            if amount > 0.01:
-                text += f"  {d_name} \u27a1 {c_name}: ${amount:.2f}\n"
-            debtors[i] = (d_name, debt - amount)
-            creditors[j] = (c_name, credit - amount)
-            if debtors[i][1] < 0.01:
-                i += 1
-            if creditors[j][1] < 0.01:
-                j += 1
-    else:
-        text += "\n\u26aa Everyone broke even across all games!"
+    payments = []
+    i, j = 0, 0
+    while i < len(debtors) and j < len(creditors):
+        d_name, debt = debtors[i]
+        c_name, credit = creditors[j]
+        amount = min(debt, credit)
+        if amount > 0.01:
+            payments.append((d_name, c_name, amount))
+        debtors[i] = (d_name, debt - amount)
+        creditors[j] = (c_name, credit - amount)
+        if debtors[i][1] < 0.01:
+            i += 1
+        if creditors[j][1] < 0.01:
+            j += 1
 
-    await update.message.reply_text(text)
+    # Unique player count
+    all_players = set()
+    for g in selected_games:
+        all_players.update(g.get("players", {}).keys())
+    player_count = len(all_players)
+
+    buf = generate_settlement_image(
+        title_line=title_line,
+        game_count=game_count,
+        total_prize_pool=total_prize_pool,
+        player_count=player_count,
+        combined_pnl=sorted_combined,
+        payments=payments,
+    )
+
+    await context.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        photo=buf,
+    )
 
 
 async def endgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
